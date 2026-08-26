@@ -6,6 +6,9 @@ from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
+COMPOSE_URL = "https://x.com/compose/tweet"
+
+
 def _storage_state() -> str | None:
     value = os.getenv("X_STORAGE_STATE", "").strip()
     if value:
@@ -39,7 +42,6 @@ def _find_visible_editor(page):
         '[role="textbox"][contenteditable="true"]',
     ]
 
-    # Prefer the composer inside the X modal/dialog when it exists.
     for scope in (page.locator('[role="dialog"]'), page.locator('body')):
         try:
             if not scope.is_visible():
@@ -112,6 +114,18 @@ def _diagnostics(page) -> dict[str, Any]:
     }
 
 
+def _install_lightweight_network_policy(page) -> None:
+    """Reduce Chromium memory/network use on Render Free without blocking X JS/CSS."""
+    def handle_route(route):
+        request = route.request
+        if request.resource_type in {"image", "media", "font"}:
+            route.abort()
+        else:
+            route.continue_()
+
+    page.route("**/*", handle_route)
+
+
 def post_x(text: str) -> dict[str, Any]:
     state = _storage_state()
     if not state:
@@ -123,16 +137,17 @@ def post_x(text: str) -> dict[str, Any]:
         state_file = None
         page = None
         try:
-            # Keep Chromium lightweight enough for Render Free (512 MB RAM).
+            # Render Free has only 512 MB RAM / 0.1 CPU. Keep Chromium to one
+            # renderer and disable non-essential background processes.
             browser = p.chromium.launch(
                 headless=True,
                 channel="chromium",
+                timeout=20000,
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--disable-software-rasterizer",
                     "--disable-background-networking",
                     "--disable-background-timer-throttling",
                     "--disable-backgrounding-occluded-windows",
@@ -140,10 +155,12 @@ def post_x(text: str) -> dict[str, Any]:
                     "--disable-component-update",
                     "--disable-default-apps",
                     "--disable-extensions",
-                    "--disable-features=Translate,BackForwardCache",
                     "--disable-sync",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--no-zygote",
+                    "--renderer-process-limit=1",
+                    "--js-flags=--max-old-space-size=128",
                 ],
             )
 
@@ -155,26 +172,15 @@ def post_x(text: str) -> dict[str, Any]:
 
             context = browser.new_context(
                 storage_state=state_file,
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 1100, "height": 800},
                 locale="en-US",
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/151.0.0.0 Safari/537.36"
-                ),
             )
             page = context.new_page()
-            page.set_default_timeout(6000)
+            page.set_default_timeout(8000)
+            _install_lightweight_network_policy(page)
 
-            # IMPORTANT: use /compose/tweet rather than /compose/post.
-            # Current X automation reports show /compose/post/home can fail
-            # to hydrate while /compose/tweet can still open the composer.
-            page.goto(
-                "https://x.com/compose/tweet",
-                wait_until="commit",
-                timeout=10000,
-            )
-            page.wait_for_timeout(3000)
+            # /compose/tweet is more reliable than opening the home composer.
+            page.goto(COMPOSE_URL, wait_until="commit", timeout=15000)
 
             if "/i/flow/login" in page.url or "/login" in page.url:
                 return {
@@ -183,20 +189,25 @@ def post_x(text: str) -> dict[str, Any]:
                     "diagnostics": _diagnostics(page),
                 }
 
-            editor = _find_visible_editor(page)
-            if editor is None:
-                return {
-                    "success": False,
-                    "message": "X compose/tweet loaded, but the tweet editor was not rendered.",
-                    "diagnostics": _diagnostics(page),
-                }
+            # Do not sleep a fixed 3 seconds. On Render Free the service may
+            # need longer after a cold start, while a warm request should return
+            # immediately. Wait only for the actual composer element.
+            editor_locator = page.locator('[data-testid="tweetTextarea_0"]').first
+            try:
+                editor_locator.wait_for(state="visible", timeout=12000)
+            except PlaywrightTimeoutError:
+                editor = _find_visible_editor(page)
+                if editor is None:
+                    return {
+                        "success": False,
+                        "message": "X compose/tweet loaded, but the tweet editor was not rendered within 12 seconds.",
+                        "diagnostics": _diagnostics(page),
+                    }
+            else:
+                editor = editor_locator
 
             editor.click()
-
-            # X's current composer can ignore programmatic fill(). Use real
-            # keyboard input instead so the React editor receives input events.
-            editor.press_sequentially(text, delay=8)
-            page.wait_for_timeout(500)
+            editor.press_sequentially(text, delay=5)
 
             button = _find_post_button(page)
             if button is None:
@@ -207,22 +218,22 @@ def post_x(text: str) -> dict[str, Any]:
                 }
 
             button.click()
-            page.wait_for_timeout(3000)
 
-            # Successful submission normally closes the compose modal.
-            if _find_visible_editor(page) is None:
+            # X is a SPA, so verify the composer disappears instead of waiting
+            # for a navigation event that may never occur.
+            try:
+                editor.wait_for(state="hidden", timeout=10000)
                 return {
                     "success": True,
                     "message": "Post submitted through X web browser automation.",
                     "url": page.url,
                 }
-
-            # Do not claim success if the composer is still open.
-            return {
-                "success": False,
-                "message": "X Post button was clicked, but the composer is still open; submission could not be verified.",
-                "diagnostics": _diagnostics(page),
-            }
+            except PlaywrightTimeoutError:
+                return {
+                    "success": False,
+                    "message": "X Post button was clicked, but the composer is still open; submission could not be verified.",
+                    "diagnostics": _diagnostics(page),
+                }
 
         except PlaywrightTimeoutError as exc:
             return {
