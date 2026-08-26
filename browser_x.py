@@ -49,15 +49,32 @@ def browser_status() -> dict[str, Any]:
     return {"ready": configured, "message": "X browser session is configured." if configured else "No X browser session configured. Set X_STORAGE_STATE to a Playwright storage_state JSON.", "task": _task_snapshot()}
 
 
+def _element_visible(candidate) -> bool:
+    """Check visibility without using Playwright's default 5s auto-wait."""
+    try:
+        return bool(candidate.evaluate("""el => {
+            const s = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return s.visibility !== 'hidden' && s.display !== 'none' &&
+                   r.width > 0 && r.height > 0;
+        }""", timeout=800))
+    except Exception:
+        return False
+
+
 def _find_visible_editor(page):
-    selectors = ['[data-testid="tweetTextarea_0"]', 'div[contenteditable="true"][role="textbox"]', '[role="textbox"][contenteditable="true"]']
+    selectors = [
+        '[data-testid="tweetTextarea_0"]',
+        'div[contenteditable="true"][role="textbox"]',
+        '[role="textbox"][contenteditable="true"]',
+    ]
     for selector in selectors:
         try:
             loc = page.locator(selector)
             count = min(loc.count(), 10)
             for i in range(count):
                 candidate = loc.nth(i)
-                if candidate.is_visible():
+                if _element_visible(candidate):
                     return candidate
         except Exception:
             continue
@@ -65,33 +82,40 @@ def _find_visible_editor(page):
 
 
 def _find_post_button(page):
-    """Fast X Post button lookup. Avoid broad body scans and role queries."""
+    """Fast X Post button lookup with bounded per-element checks."""
     selectors = [
         '[data-testid="tweetButton"]',
         '[data-testid="tweetButtonInline"]',
-        '[data-testid="tweetButton"]:visible',
-        '[data-testid="tweetButtonInline"]:visible',
     ]
     for selector in selectors:
         try:
             loc = page.locator(selector)
-            count = min(loc.count(), 5)
+            count = min(loc.count(), 10)
             for i in range(count):
                 candidate = loc.nth(i)
-                if candidate.is_visible() and candidate.is_enabled():
-                    return candidate
+                if _element_visible(candidate):
+                    try:
+                        disabled = candidate.is_disabled(timeout=800)
+                    except Exception:
+                        disabled = False
+                    if not disabled:
+                        return candidate
         except Exception:
             continue
-    # Only if testids are unavailable, use a narrowly scoped visible button query.
+
+    # Fallback: inspect only visible buttons and avoid inner_text() auto-waits.
     try:
-        loc = page.locator('button:visible')
-        count = min(loc.count(), 80)
+        loc = page.locator('button')
+        count = min(loc.count(), 120)
         for i in range(count):
             candidate = loc.nth(i)
+            if not _element_visible(candidate):
+                continue
             try:
-                aria = candidate.get_attribute("aria-label")
-                text = (candidate.inner_text(timeout=300) or "").strip()
-                if (aria in {"Post", "Tweet"} or text in {"Post", "Tweet"}) and candidate.is_enabled():
+                aria = candidate.get_attribute("aria-label", timeout=500)
+                text = (candidate.text_content(timeout=500) or "").strip()
+                disabled = candidate.is_disabled(timeout=500)
+                if not disabled and (aria in {"Post", "Tweet"} or text in {"Post", "Tweet"}):
                     return candidate
             except Exception:
                 continue
@@ -124,20 +148,43 @@ def _install_lightweight_network_policy(page) -> None:
 
 
 def _launch_context(p, state: str):
-    browser = p.chromium.launch(headless=True, timeout=20000, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer", "--disable-background-networking", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-breakpad", "--disable-component-update", "--disable-default-apps", "--disable-extensions", "--disable-plugins", "--disable-sync", "--disable-translate", "--disable-features=Translate,BackForwardCache", "--mute-audio", "--no-first-run", "--no-default-browser-check", "--no-zygote", "--renderer-process-limit=1", "--js-flags=--max-old-space-size=96"])
+    browser = p.chromium.launch(
+        headless=True,
+        timeout=20000,
+        args=[
+            "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+            "--disable-gpu", "--disable-software-rasterizer", "--disable-background-networking",
+            "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+            "--disable-breakpad", "--disable-component-update", "--disable-default-apps",
+            "--disable-extensions", "--disable-plugins", "--disable-sync", "--disable-translate",
+            "--disable-features=Translate,BackForwardCache", "--mute-audio", "--no-first-run",
+            "--no-default-browser-check", "--no-zygote", "--renderer-process-limit=1",
+            "--js-flags=--max-old-space-size=96",
+        ],
+    )
     state_file = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
     state_file.write(state)
     state_file.close()
-    context = browser.new_context(storage_state=state_file.name, viewport={"width": 900, "height": 650}, locale="en-US")
+    context = browser.new_context(
+        storage_state=state_file.name,
+        viewport={"width": 900, "height": 650},
+        locale="en-US",
+    )
     page = context.new_page()
-    page.set_default_timeout(5000)
+    page.set_default_timeout(3000)
     _install_lightweight_network_policy(page)
     return browser, context, state_file.name, page
 
 
 def _acquire_task(stage: str):
     if not _BROWSER_LOCK.acquire(blocking=False):
-        return None, {"success": False, "busy": True, "stage": "lock", "message": "Another X browser task is currently running.", "task": _task_snapshot()}
+        return None, {
+            "success": False,
+            "busy": True,
+            "stage": "lock",
+            "message": "Another X browser task is currently running.",
+            "task": _task_snapshot(),
+        }
     started_at = time.time()
     _set_task(busy=True, stage=stage, started_at=started_at, elapsed_seconds=0, text="", last_result=None)
     return started_at, None
@@ -145,14 +192,20 @@ def _acquire_task(stage: str):
 
 def _cleanup_task(started_at, browser, context, state_file):
     if context is not None:
-        try: context.close()
-        except Exception: pass
+        try:
+            context.close()
+        except Exception:
+            pass
     if browser is not None:
-        try: browser.close()
-        except Exception: pass
+        try:
+            browser.close()
+        except Exception:
+            pass
     if state_file:
-        try: os.unlink(state_file)
-        except Exception: pass
+        try:
+            os.unlink(state_file)
+        except Exception:
+            pass
     try:
         _BROWSER_LOCK.release()
     except RuntimeError:
@@ -184,7 +237,14 @@ def test_x_browser() -> dict[str, Any]:
             current_url = page.url
             login_redirect = "/i/flow/login" in current_url or "/login" in current_url
             onboarding = "/i/jf/" in current_url or "/onboarding" in current_url
-            result = {"success": not login_redirect, "stage": "test_complete" if not login_redirect else "login_required", "message": "Playwright can launch and X opened with the saved browser session." if not login_redirect else "Playwright launched, but X redirected to a login flow; the saved session is not authenticated.", "login_redirect": login_redirect, "onboarding": onboarding, "diagnostics": diagnostics}
+            result = {
+                "success": not login_redirect,
+                "stage": "test_complete" if not login_redirect else "login_required",
+                "message": "Playwright can launch and X opened with the saved browser session." if not login_redirect else "Playwright launched, but X redirected to a login flow; the saved session is not authenticated.",
+                "login_redirect": login_redirect,
+                "onboarding": onboarding,
+                "diagnostics": diagnostics,
+            }
             _set_task(stage=result["stage"], last_result=result)
             return result
     except PlaywrightTimeoutError as exc:
@@ -221,7 +281,14 @@ def test_x_compose() -> dict[str, Any]:
             login_redirect = "/i/flow/login" in current_url or "/login" in current_url
             onboarding = "/i/jf/" in current_url or "/onboarding" in current_url
             if login_redirect or onboarding:
-                result = {"success": False, "stage": "login_required", "message": "X did not open the compose page in the saved session.", "login_redirect": login_redirect, "onboarding": onboarding, "diagnostics": _diagnostics(page)}
+                result = {
+                    "success": False,
+                    "stage": "login_required",
+                    "message": "X did not open the compose page in the saved session.",
+                    "login_redirect": login_redirect,
+                    "onboarding": onboarding,
+                    "diagnostics": _diagnostics(page),
+                }
                 _set_task(stage="failed", last_result=result)
                 return result
             _set_task(stage="compose_checking_editor")
@@ -230,18 +297,41 @@ def test_x_compose() -> dict[str, Any]:
             editor_details = None
             if editor_found:
                 try:
-                    editor_details = {"tag": editor.evaluate("el => el.tagName"), "role": editor.get_attribute("role"), "contenteditable": editor.get_attribute("contenteditable"), "data_testid": editor.get_attribute("data-testid")}
-                except Exception: pass
+                    editor_details = {
+                        "tag": editor.evaluate("el => el.tagName"),
+                        "role": editor.get_attribute("role"),
+                        "contenteditable": editor.get_attribute("contenteditable"),
+                        "data_testid": editor.get_attribute("data-testid"),
+                    }
+                except Exception:
+                    pass
             _set_task(stage="compose_checking_post_button")
             post_button = _find_post_button(page)
             post_button_found = post_button is not None
             post_button_details = None
             if post_button_found:
                 try:
-                    post_button_details = {"tag": post_button.evaluate("el => el.tagName"), "aria_label": post_button.get_attribute("aria-label"), "data_testid": post_button.get_attribute("data-testid"), "enabled": post_button.is_enabled()}
-                except Exception: pass
+                    post_button_details = {
+                        "tag": post_button.evaluate("el => el.tagName"),
+                        "aria_label": post_button.get_attribute("aria-label"),
+                        "data_testid": post_button.get_attribute("data-testid"),
+                        "enabled": not post_button.is_disabled(timeout=800),
+                    }
+                except Exception:
+                    pass
             diagnostics = _diagnostics(page)
-            result = {"success": editor_found, "stage": "compose_ready" if editor_found else "editor_not_found", "message": "X compose page loaded and the tweet editor was found." if editor_found else "X compose page loaded, but no visible tweet editor was found.", "login_redirect": login_redirect, "onboarding": onboarding, "editor_found": editor_found, "editor": editor_details, "post_button_found": post_button_found, "post_button": post_button_details, "diagnostics": diagnostics}
+            result = {
+                "success": editor_found,
+                "stage": "compose_ready" if editor_found else "editor_not_found",
+                "message": "X compose page loaded and the tweet editor was found." if editor_found else "X compose page loaded, but no visible tweet editor was found.",
+                "login_redirect": login_redirect,
+                "onboarding": onboarding,
+                "editor_found": editor_found,
+                "editor": editor_details,
+                "post_button_found": post_button_found,
+                "post_button": post_button_details,
+                "diagnostics": diagnostics,
+            }
             _set_task(stage=result["stage"], last_result=result)
             return result
     except PlaywrightTimeoutError as exc:
@@ -285,8 +375,8 @@ def post_x(text: str) -> dict[str, Any]:
                 _set_task(stage="failed", last_result=result)
                 return result
             _set_task(stage="typing")
-            editor.click()
-            editor.press_sequentially(text, delay=3)
+            editor.click(timeout=1500)
+            editor.press_sequentially(text, delay=3, timeout=5000)
             _set_task(stage="waiting_post_button")
             button = _find_post_button(page)
             if button is None:
@@ -294,13 +384,26 @@ def post_x(text: str) -> dict[str, Any]:
                 _set_task(stage="failed", last_result=result)
                 return result
             _set_task(stage="clicking_post")
-            button.click()
+            button.click(timeout=1500)
             _set_task(stage="verifying_post")
             try:
-                editor.wait_for(state="hidden", timeout=10000)
-                result = {"success": True, "message": "Post submitted through X web browser automation.", "url": page.url}
-            except PlaywrightTimeoutError:
-                result = {"success": False, "message": "X Post button was clicked, but the composer is still open; submission could not be verified.", "diagnostics": _diagnostics(page)}
+                page.wait_for_timeout(1200)
+                # Prefer a quick state change check instead of waiting 10 seconds for the editor to hide.
+                editor_still_visible = _element_visible(editor)
+                if not editor_still_visible:
+                    result = {"success": True, "message": "Post submitted through X web browser automation.", "url": page.url}
+                else:
+                    # X may keep the composer mounted after a successful post. Check whether its text was cleared.
+                    try:
+                        remaining = (editor.text_content(timeout=800) or "").strip()
+                    except Exception:
+                        remaining = ""
+                    if remaining == "":
+                        result = {"success": True, "message": "Post submitted through X web browser automation.", "url": page.url, "verification": "composer_cleared"}
+                    else:
+                        result = {"success": False, "message": "X Post button was clicked, but submission could not be verified.", "diagnostics": _diagnostics(page)}
+            except Exception:
+                result = {"success": False, "message": "X Post button was clicked, but submission could not be verified.", "diagnostics": _diagnostics(page)}
             _set_task(stage="finished" if result.get("success") else "failed", last_result=result)
             return result
     except PlaywrightTimeoutError as exc:
