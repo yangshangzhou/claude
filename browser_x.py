@@ -21,7 +21,7 @@ _TASK_STATE: dict[str, Any] = {
     "last_result": None,
 }
 
-TASK_HARD_TIMEOUT = 45
+TASK_HARD_TIMEOUT = 60
 
 
 def _storage_state() -> str | None:
@@ -59,9 +59,7 @@ def _set_task(**updates: Any) -> None:
 
 def _check_deadline(started_at: float) -> None:
     if time.time() - started_at > TASK_HARD_TIMEOUT:
-        raise TimeoutError(
-            f"X browser task exceeded the {TASK_HARD_TIMEOUT}s hard timeout."
-        )
+        raise TimeoutError(f"X browser task exceeded the {TASK_HARD_TIMEOUT}s hard timeout.")
 
 
 def browser_status() -> dict[str, Any]:
@@ -79,155 +77,188 @@ def browser_status() -> dict[str, Any]:
 
 def _element_visible(candidate) -> bool:
     try:
-        return bool(
-            candidate.evaluate(
-                """el => {
-                    const s = window.getComputedStyle(el);
-                    const r = el.getBoundingClientRect();
-                    return s.visibility !== 'hidden' &&
-                           s.display !== 'none' &&
-                           r.width > 0 && r.height > 0;
-                }""",
-                timeout=800,
-            )
-        )
+        return bool(candidate.evaluate("""el => {
+            const s = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+        }""", timeout=800))
     except Exception:
         return False
 
 
 def _find_visible_editor(page):
+    """Find the currently visible X composer editor using a DOM scan.
+
+    X has changed the composer markup several times. Do not depend on a single
+    data-testid; prefer contenteditable/role semantics and use data-testid as
+    the first candidate when it exists.
+    """
     try:
-        info = page.evaluate(
-            """() => {
-                const selectors = [
-                    '[data-testid="tweetTextarea_0"]',
-                    'div[contenteditable="true"][role="textbox"]',
-                    '[role="textbox"][contenteditable="true"]'
-                ];
-                for (const selector of selectors) {
-                    const nodes = Array.from(document.querySelectorAll(selector));
-                    for (const el of nodes) {
-                        const r = el.getBoundingClientRect();
-                        const s = getComputedStyle(el);
-                        if (s.display !== 'none' && s.visibility !== 'hidden' &&
-                            r.width > 0 && r.height > 0) {
-                            return {
-                                selector,
-                                testid: el.getAttribute('data-testid')
-                            };
-                        }
-                    }
-                }
-                return null;
-            }"""
-        )
-        if not info:
-            return None
-
-        if info.get("testid"):
-            return page.locator(f'[data-testid="{info["testid"]}"]').first
-        return page.locator(info["selector"]).first
-    except Exception:
-        return None
-
-
-def _find_post_button(page):
-    """Find X's Post button with one browser-side DOM scan."""
-    try:
-        info = page.evaluate(
-            """() => {
-                const isVisible = el => {
-                    const r = el.getBoundingClientRect();
-                    const s = getComputedStyle(el);
-                    return s.display !== 'none' &&
-                           s.visibility !== 'hidden' &&
-                           r.width > 0 && r.height > 0;
-                };
-
-                const candidates = [
-                    ...document.querySelectorAll('[data-testid="tweetButton"]'),
-                    ...document.querySelectorAll('[data-testid="tweetButtonInline"]')
-                ];
-
-                for (const el of candidates) {
-                    if (!isVisible(el)) continue;
-                    const disabled = el.disabled === true ||
-                        el.getAttribute('aria-disabled') === 'true';
-                    if (!disabled) {
+        info = page.evaluate("""() => {
+            const selectors = [
+                '[data-testid="tweetTextarea_0"]',
+                'div[contenteditable="true"][role="textbox"]',
+                '[role="textbox"][contenteditable="true"]',
+                '[contenteditable="true"]',
+                'textarea'
+            ];
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+            };
+            for (const selector of selectors) {
+                for (const el of Array.from(document.querySelectorAll(selector))) {
+                    if (visible(el)) {
                         return {
+                            selector,
                             testid: el.getAttribute('data-testid'),
-                            aria: el.getAttribute('aria-label'),
-                            text: (el.innerText || '').trim(),
-                            index: -1
+                            role: el.getAttribute('role'),
+                            tag: el.tagName
                         };
                     }
                 }
-
-                const buttons = Array.from(document.querySelectorAll('button'));
-                for (let i = 0; i < buttons.length; i++) {
-                    const el = buttons[i];
-                    if (!isVisible(el)) continue;
-                    const aria = (el.getAttribute('aria-label') || '').trim();
-                    const text = (el.innerText || '').trim();
-                    const disabled = el.disabled === true ||
-                        el.getAttribute('aria-disabled') === 'true';
-                    if (!disabled &&
-                        (aria === 'Post' || aria === 'Tweet' ||
-                         text === 'Post' || text === 'Tweet')) {
-                        return {
-                            testid: el.getAttribute('data-testid'),
-                            aria,
-                            text,
-                            index: i
-                        };
-                    }
-                }
-                return null;
-            }"""
-        )
+            }
+            return null;
+        }""")
     except Exception:
         return None
 
     if not info:
         return None
+    try:
+        if info.get("testid"):
+            loc = page.locator(f'[data-testid="{info["testid"]}"]').first
+        else:
+            loc = page.locator(info["selector"]).first
+        return loc if _element_visible(loc) else None
+    except Exception:
+        return None
 
+
+def _find_new_post_button(page):
+    """Find X's navigation compose button without relying on visible text."""
+    try:
+        info = page.evaluate("""() => {
+            const selectors = [
+                '[data-testid="SideNav_NewTweet_Button"]',
+                'a[href="/compose/post"]',
+                'a[href="/compose/tweet"]',
+                '[data-testid="tweetButtonInline"]'
+            ];
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+            };
+            for (const selector of selectors) {
+                const el = Array.from(document.querySelectorAll(selector)).find(visible);
+                if (el) return {selector};
+            }
+            return null;
+        }""")
+    except Exception:
+        return None
+    if not info:
+        return None
+    try:
+        loc = page.locator(info["selector"]).first
+        return loc if _element_visible(loc) else None
+    except Exception:
+        return None
+
+
+def _find_post_button(page):
+    """Find X's enabled Post button with one browser-side DOM scan."""
+    try:
+        info = page.evaluate("""() => {
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+            };
+            const candidates = [
+                ...document.querySelectorAll('[data-testid="tweetButton"]'),
+                ...document.querySelectorAll('[data-testid="tweetButtonInline"]')
+            ];
+            for (const el of candidates) {
+                if (!visible(el)) continue;
+                const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+                if (!disabled) return {testid: el.getAttribute('data-testid'), index: -1};
+            }
+            const buttons = Array.from(document.querySelectorAll('button'));
+            for (let i = 0; i < buttons.length; i++) {
+                const el = buttons[i];
+                if (!visible(el)) continue;
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                const text = (el.innerText || '').trim();
+                const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+                if (!disabled && (aria === 'Post' || aria === 'Tweet' || text === 'Post' || text === 'Tweet')) {
+                    return {testid: el.getAttribute('data-testid'), index: i};
+                }
+            }
+            return null;
+        }""")
+    except Exception:
+        return None
+    if not info:
+        return None
     try:
         if info.get("testid"):
             loc = page.locator(f'[data-testid="{info["testid"]}"]')
-            count = loc.count()
-            for i in range(min(count, 5)):
+            for i in range(min(loc.count(), 5)):
                 candidate = loc.nth(i)
                 if _element_visible(candidate):
                     return candidate
-
         index = info.get("index", -1)
         if isinstance(index, int) and index >= 0:
             return page.locator("button").nth(index)
     except Exception:
         pass
-
     return None
 
 
 def _diagnostics(page) -> dict[str, Any]:
-    body_text = ""
-    test_ids: list[str] = []
+    result: dict[str, Any] = {
+        "url": page.url if page else "",
+        "title": "",
+        "ready_state": "",
+        "html_length": 0,
+        "body_exists": False,
+        "body_children": 0,
+        "body": "",
+        "test_ids": [],
+    }
+    if not page:
+        return result
     try:
-        body_text = page.locator("body").inner_text(timeout=1500)[:2000]
+        result.update(page.evaluate("""() => ({
+            ready_state: document.readyState,
+            html_length: document.documentElement ? document.documentElement.outerHTML.length : 0,
+            body_exists: !!document.body,
+            body_children: document.body ? document.body.children.length : 0
+        })"""))
     except Exception:
         pass
     try:
-        test_ids = page.locator("[data-testid]").evaluate_all(
-            """els => Array.from(new Set(
-                els.map(e => e.getAttribute('data-testid')).filter(Boolean)
-            )).slice(0, 80)"""
-        )
+        result["title"] = page.title()
     except Exception:
         pass
-    return {"url": page.url, "title": page.title(), "body": body_text, "test_ids": test_ids}
+    try:
+        result["body"] = page.locator("body").inner_text(timeout=1500)[:2000]
+    except Exception:
+        pass
+    try:
+        result["test_ids"] = page.locator("[data-testid]").evaluate_all("""els => Array.from(new Set(
+            els.map(e => e.getAttribute('data-testid')).filter(Boolean)
+        )).slice(0, 80)""")
+    except Exception:
+        pass
+    return result
 
 
 def _install_lightweight_network_policy(page) -> None:
+    # Keep normal X HTML/JS/API traffic. Only skip heavy visual resources.
     def handle_route(route):
         if route.request.resource_type in {"image", "media", "font"}:
             route.abort()
@@ -237,18 +268,31 @@ def _install_lightweight_network_policy(page) -> None:
 
 
 def _launch_context(p, state: str):
+    # The previous configuration used --only-shell plus aggressive renderer and
+    # JS-memory limits. The observed Render result had a valid URL but an empty
+    # DOM, so use a normal Chromium build and let Chromium manage its renderer.
     browser = p.chromium.launch(
         headless=True,
         timeout=20000,
         args=[
-            "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-            "--disable-gpu", "--disable-software-rasterizer", "--disable-background-networking",
-            "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
-            "--disable-breakpad", "--disable-component-update", "--disable-default-apps",
-            "--disable-extensions", "--disable-plugins", "--disable-sync", "--disable-translate",
-            "--disable-features=Translate,BackForwardCache", "--mute-audio", "--no-first-run",
-            "--no-default-browser-check", "--no-zygote", "--renderer-process-limit=1",
-            "--js-flags=--max-old-space-size=96",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-breakpad",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-plugins",
+            "--disable-sync",
+            "--disable-translate",
+            "--disable-features=Translate,BackForwardCache",
+            "--mute-audio",
+            "--no-first-run",
+            "--no-default-browser-check",
         ],
     )
     state_file = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
@@ -256,13 +300,62 @@ def _launch_context(p, state: str):
     state_file.close()
     context = browser.new_context(
         storage_state=state_file.name,
-        viewport={"width": 900, "height": 650},
+        viewport={"width": 1280, "height": 900},
         locale="en-US",
     )
     page = context.new_page()
-    page.set_default_timeout(3000)
+    page.set_default_timeout(5000)
     _install_lightweight_network_policy(page)
     return browser, context, state_file.name, page
+
+
+def _wait_for_app(page, started_at: float, timeout_ms: int = 15000) -> bool:
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        _check_deadline(started_at)
+        try:
+            mounted = page.evaluate("""() => !!document.body && document.body.children.length > 0""")
+            if mounted:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    return False
+
+
+def _open_compose(page, started_at: float) -> str:
+    """Open the compose UI from Home first, with direct URL as fallback."""
+    _set_task(stage="opening_home")
+    page.goto(_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+    _wait_for_app(page, started_at, 12000)
+    _check_deadline(started_at)
+    if _login_state(page) or _onboarding_state(page):
+        return page.url
+
+    _set_task(stage="opening_compose")
+    new_post = _find_new_post_button(page)
+    if new_post is not None:
+        try:
+            new_post.click(timeout=2500)
+            page.wait_for_timeout(1000)
+            return page.url
+        except Exception:
+            pass
+
+    page.goto(COMPOSE_URL, wait_until="domcontentloaded", timeout=20000)
+    _wait_for_app(page, started_at, 12000)
+    return page.url
+
+
+def _wait_for_editor(page, started_at: float, timeout_ms: int = 12000):
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        _check_deadline(started_at)
+        editor = _find_visible_editor(page)
+        if editor is not None:
+            return editor
+        page.wait_for_timeout(500)
+    return None
 
 
 def _acquire_task(stage: str):
@@ -328,16 +421,17 @@ def test_x_browser() -> dict[str, Any]:
             _set_task(stage="test_launching_browser")
             browser, context, state_file, page = _launch_context(p, state)
             _set_task(stage="test_opening_x")
-            page.goto(_HOME_URL, wait_until="commit", timeout=20000)
-            page.wait_for_timeout(3000)
+            page.goto(_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+            mounted = _wait_for_app(page, started_at, 15000)
+            page.wait_for_timeout(1500)
             _check_deadline(started_at)
             diagnostics = _diagnostics(page)
             login_redirect = _login_state(page)
             onboarding = _onboarding_state(page)
             result = {
-                "success": not login_redirect,
-                "stage": "test_complete" if not login_redirect else "login_required",
-                "message": "Playwright can launch and X opened with the saved browser session." if not login_redirect else "Playwright launched, but X redirected to a login flow.",
+                "success": not login_redirect and mounted,
+                "stage": "test_complete" if not login_redirect and mounted else ("login_required" if login_redirect else "x_dom_not_mounted"),
+                "message": "Playwright launched and X mounted with the saved browser session." if not login_redirect and mounted else "X did not finish mounting its web application in the browser.",
                 "login_redirect": login_redirect,
                 "onboarding": onboarding,
                 "diagnostics": diagnostics,
@@ -372,9 +466,7 @@ def test_x_compose() -> dict[str, Any]:
         with sync_playwright() as p:
             _set_task(stage="compose_launching_browser")
             browser, context, state_file, page = _launch_context(p, state)
-            _set_task(stage="compose_opening_x")
-            page.goto(COMPOSE_URL, wait_until="commit", timeout=20000)
-            page.wait_for_timeout(2500)
+            _open_compose(page, started_at)
             _check_deadline(started_at)
             login_redirect = _login_state(page)
             onboarding = _onboarding_state(page)
@@ -389,10 +481,10 @@ def test_x_compose() -> dict[str, Any]:
                 }
                 _set_task(stage="failed", last_result=result)
                 return result
-            _set_task(stage="compose_checking_editor")
-            editor = _find_visible_editor(page)
+
+            _set_task(stage="compose_waiting_editor")
+            editor = _wait_for_editor(page, started_at, 12000)
             editor_found = editor is not None
-            _check_deadline(started_at)
             editor_details = None
             if editor_found:
                 try:
@@ -404,9 +496,9 @@ def test_x_compose() -> dict[str, Any]:
                     }
                 except Exception:
                     pass
+
             _set_task(stage="compose_checking_post_button")
-            post_button = _find_post_button(page)
-            _check_deadline(started_at)
+            post_button = _find_post_button(page) if editor_found else None
             post_button_found = post_button is not None
             post_button_details = None
             if post_button_found:
@@ -423,7 +515,7 @@ def test_x_compose() -> dict[str, Any]:
             result = {
                 "success": editor_found,
                 "stage": "compose_ready" if editor_found else "editor_not_found",
-                "message": "X compose page loaded and the tweet editor was found." if editor_found else "X compose page loaded, but no visible tweet editor was found.",
+                "message": "X compose UI loaded and the tweet editor was found." if editor_found else "X opened, but the tweet editor was not rendered.",
                 "login_redirect": login_redirect,
                 "onboarding": onboarding,
                 "editor_found": editor_found,
@@ -463,8 +555,7 @@ def post_x(text: str) -> dict[str, Any]:
         with sync_playwright() as p:
             _set_task(stage="launching_browser")
             browser, context, state_file, page = _launch_context(p, state)
-            _set_task(stage="opening_x")
-            page.goto(COMPOSE_URL, wait_until="commit", timeout=20000)
+            _open_compose(page, started_at)
             _check_deadline(started_at)
             if _login_state(page):
                 result = {"success": False, "message": "X browser session has expired.", "diagnostics": _diagnostics(page)}
@@ -474,37 +565,47 @@ def post_x(text: str) -> dict[str, Any]:
                 result = {"success": False, "message": "X opened an onboarding flow instead of the compose page.", "diagnostics": _diagnostics(page)}
                 _set_task(stage="failed", last_result=result)
                 return result
+
             _set_task(stage="waiting_editor")
-            editor = _find_visible_editor(page)
-            _check_deadline(started_at)
+            editor = _wait_for_editor(page, started_at, 12000)
             if editor is None:
-                result = {"success": False, "message": "X compose/tweet loaded, but the tweet editor was not rendered.", "diagnostics": _diagnostics(page)}
+                result = {"success": False, "message": "X compose UI loaded, but the tweet editor was not rendered.", "diagnostics": _diagnostics(page)}
                 _set_task(stage="failed", last_result=result)
                 return result
+
             _set_task(stage="typing")
-            editor.click(timeout=1500)
-            editor.press_sequentially(text, delay=3, timeout=5000)
+            editor.click(timeout=2500)
+            editor.press_sequentially(text, delay=3, timeout=6000)
             _check_deadline(started_at)
+
             _set_task(stage="waiting_post_button")
-            button = _find_post_button(page)
-            _check_deadline(started_at)
+            button = None
+            deadline = time.time() + 8000 / 1000
+            while time.time() < deadline:
+                button = _find_post_button(page)
+                if button is not None:
+                    break
+                page.wait_for_timeout(400)
+                _check_deadline(started_at)
             if button is None:
                 result = {"success": False, "message": "X editor was found and text was typed, but the Post button was not found/enabled.", "diagnostics": _diagnostics(page)}
                 _set_task(stage="failed", last_result=result)
                 return result
+
             _set_task(stage="clicking_post")
-            button.click(timeout=1500)
+            button.click(timeout=2500)
             _set_task(stage="verifying_post")
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1500)
+            _check_deadline(started_at)
             editor_visible = _element_visible(editor)
             editor_text = ""
             try:
-                editor_text = (editor.text_content(timeout=500) or "").strip()
+                editor_text = (editor.text_content(timeout=800) or "").strip()
             except Exception:
                 pass
             alert_text = ""
             try:
-                alert_text = (page.locator('[role="alert"]').first.text_content(timeout=500) or "").strip()
+                alert_text = (page.locator('[role="alert"]').first.text_content(timeout=800) or "").strip()
             except Exception:
                 pass
             success = (not editor_visible) or (not editor_text)
