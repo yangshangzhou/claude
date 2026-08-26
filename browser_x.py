@@ -32,6 +32,61 @@ def browser_status() -> dict[str, Any]:
     return {"ready": True, "message": "X browser session is configured."}
 
 
+def _find_visible_editor(page):
+    """Find X's compose editor using several selectors because X changes its DOM frequently."""
+    selectors = [
+        '[data-testid="tweetTextarea_0"]',
+        'div[contenteditable="true"][role="textbox"]',
+        'div[contenteditable="true"]',
+        '[role="textbox"][contenteditable="true"]',
+    ]
+
+    for selector in selectors:
+        loc = page.locator(selector)
+        count = loc.count()
+        for i in range(min(count, 10)):
+            candidate = loc.nth(i)
+            try:
+                if candidate.is_visible():
+                    return candidate
+            except Exception:
+                pass
+    return None
+
+
+def _find_post_button(page):
+    """Find the active Post button using X's current and fallback selectors."""
+    selectors = [
+        '[data-testid="tweetButtonInline"]',
+        '[data-testid="tweetButton"]',
+        'button[aria-label="Post"]',
+    ]
+
+    for selector in selectors:
+        loc = page.locator(selector)
+        count = loc.count()
+        for i in range(min(count, 10)):
+            candidate = loc.nth(i)
+            try:
+                if candidate.is_visible() and candidate.is_enabled():
+                    return candidate
+            except Exception:
+                pass
+
+    # Last fallback: an enabled button whose accessible name is exactly Post.
+    try:
+        loc = page.get_by_role("button", name="Post", exact=True)
+        count = loc.count()
+        for i in range(min(count, 10)):
+            candidate = loc.nth(i)
+            if candidate.is_visible() and candidate.is_enabled():
+                return candidate
+    except Exception:
+        pass
+
+    return None
+
+
 def post_x(text: str) -> dict[str, Any]:
     state = _storage_state()
     if not state:
@@ -40,37 +95,95 @@ def post_x(text: str) -> dict[str, Any]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = None
+        state_file = None
         try:
-            # Use a temporary file because Playwright accepts a path for storage_state.
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False, encoding="utf-8"
+            ) as f:
                 f.write(state)
                 state_file = f.name
 
-            context = browser.new_context(storage_state=state_file)
+            context = browser.new_context(
+                storage_state=state_file,
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/151.0.0.0 Safari/537.36"
+                ),
+            )
             page = context.new_page()
-            page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2500)
+            page.set_default_timeout(15000)
 
-            # If the stored session has expired, X normally redirects to login.
+            # X's React UI can occasionally fail to hydrate on /compose/post in an
+            # automated browser. Start from Home, then open the composer explicitly.
+            page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(5000)
+
             if "/i/flow/login" in page.url or "/login" in page.url:
                 return {
                     "success": False,
                     "message": "X browser session has expired. Generate a new Playwright storage_state locally and update X_STORAGE_STATE on Render."
                 }
 
-            box = page.locator('[data-testid="tweetTextarea_0"]').first
-            box.wait_for(state="visible", timeout=15000)
-            box.fill(text)
+            editor = _find_visible_editor(page)
 
-            button = page.locator('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]').first
-            button.wait_for(state="visible", timeout=10000)
+            # If the home-page composer is not present, open the dedicated composer.
+            if editor is None:
+                try:
+                    compose_link = page.locator('a[href="/compose/post"]').first
+                    if compose_link.count() and compose_link.is_visible():
+                        compose_link.click()
+                    else:
+                        compose_button = page.locator('[data-testid="SideNav_NewTweet_Button"]').first
+                        if compose_button.count() and compose_button.is_visible():
+                            compose_button.click()
+                        else:
+                            page.goto(
+                                "https://x.com/compose/post",
+                                wait_until="domcontentloaded",
+                                timeout=30000,
+                            )
+                    page.wait_for_timeout(4000)
+                except Exception:
+                    page.wait_for_timeout(2000)
+
+                editor = _find_visible_editor(page)
+
+            if editor is None:
+                # Return useful diagnostics instead of the generic selector timeout.
+                body_text = ""
+                try:
+                    body_text = page.locator("body").inner_text(timeout=3000)[:1000]
+                except Exception:
+                    pass
+                return {
+                    "success": False,
+                    "message": (
+                        "X compose editor was not found after loading the authenticated web UI. "
+                        f"url={page.url!r}; title={page.title()!r}; body={body_text!r}"
+                    ),
+                }
+
+            editor.click()
+            editor.fill(text)
+
+            button = _find_post_button(page)
+            if button is None:
+                return {
+                    "success": False,
+                    "message": (
+                        "X compose editor was found and text was entered, but the Post button "
+                        f"was not found. url={page.url!r}"
+                    ),
+                }
+
             button.click()
+            page.wait_for_timeout(5000)
 
-            # Give X time to submit and render the result.
-            page.wait_for_timeout(4000)
-
-            # X normally returns to the timeline after a successful post.
-            if page.locator('[data-testid="tweetTextarea_0"]').count() == 0:
+            # X normally closes the compose dialog after a successful submission.
+            if _find_visible_editor(page) is None:
                 return {
                     "success": True,
                     "message": "Post submitted through X web browser automation."
@@ -80,10 +193,11 @@ def post_x(text: str) -> dict[str, Any]:
                 "success": True,
                 "message": "Post submission command completed through X web browser automation."
             }
+
         except PlaywrightTimeoutError as exc:
             return {
                 "success": False,
-                "message": f"X web UI timed out: {exc}"
+                "message": f"X web UI timed out: {exc}; url={page.url if 'page' in locals() else 'unknown'}"
             }
         except Exception as exc:
             return {
@@ -94,7 +208,8 @@ def post_x(text: str) -> dict[str, Any]:
             if context is not None:
                 context.close()
             browser.close()
-            try:
-                os.unlink(state_file)
-            except Exception:
-                pass
+            if state_file:
+                try:
+                    os.unlink(state_file)
+                except Exception:
+                    pass
