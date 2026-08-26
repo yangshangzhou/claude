@@ -24,6 +24,21 @@ def post_status():
     return browser_status().get("task", {})
 
 
+@app.get("/mcp/test")
+def test_api():
+    """Fast, side-effect-free diagnostic endpoint.
+
+    This deliberately does not touch Playwright or X. If this returns 200,
+    Render -> Uvicorn -> FastAPI routing is healthy and any remaining failure
+    is downstream of the basic HTTP application layer.
+    """
+    return {
+        "success": True,
+        "message": "FastAPI routing is working.",
+        "playwright_touched": False,
+    }
+
+
 @app.post("/mcp/create_post")
 def create_post(post: Post):
     text = post.text.strip()
