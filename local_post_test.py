@@ -8,6 +8,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "x_state.json"
 HOME_URL = "https://x.com/home"
 COMPOSE_URL = "https://x.com/compose/tweet"
+TEST_TEXT = "LOCAL_X_TYPE_TEST_123"
 
 
 def visible(el):
@@ -58,6 +59,10 @@ def button_state(button):
         return {'error': repr(e)}
 
 
+def enabled(state):
+    return bool(state and state.get('disabled') is False and state.get('aria_disabled') != 'true')
+
+
 def snapshot(page):
     editor = find_editor(page)
     button = find_post_button(page)
@@ -93,11 +98,21 @@ def find_compose_entry(page):
     return None
 
 
+def wait_for_editor(page, seconds=15):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        editor = find_editor(page)
+        if editor:
+            return editor
+        page.wait_for_timeout(500)
+    return None
+
+
 def main():
-    print("X local MANUAL typing diagnostic")
-    print("Program will NOT type, fill, click Post, or close the browser automatically.")
-    print("You will type manually. The program only observes the editor and Post button.")
-    print("Press Ctrl+C when you are finished.")
+    print("X local REAL keyboard typing -> AUTO POST diagnostic")
+    print("This version uses keyboard.type(), not fill() or insert_text().")
+    print("It waits for X to enable Post before clicking.")
+    print("After clicking, the browser stays open. Ctrl+C closes it.")
 
     if not STATE_FILE.exists():
         print("ERROR: x_state.json not found.")
@@ -125,58 +140,85 @@ def main():
         try:
             print("\n[1] Opening X home...")
             page.goto(HOME_URL, wait_until='domcontentloaded', timeout=20000)
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(4000)
 
             editor = find_editor(page)
             if editor is None:
                 entry = find_compose_entry(page)
-                print("HOME EDITOR FOUND:", bool(editor))
-                print("COMPOSE ENTRY FOUND:", bool(entry))
                 if entry:
-                    print("Clicking X compose entry...")
+                    print("Clicking compose entry...")
                     entry.click(timeout=3000)
-                    page.wait_for_timeout(3000)
+                    editor = wait_for_editor(page, 15)
                 else:
-                    print("No compose entry found. Trying direct compose URL as fallback...")
+                    print("Compose entry not found; trying direct compose URL...")
                     page.goto(COMPOSE_URL, wait_until='domcontentloaded', timeout=20000)
-                    page.wait_for_timeout(5000)
-
-                editor = find_editor(page)
+                    editor = wait_for_editor(page, 15)
 
             if editor is None:
-                print("ERROR: editor not found after home->compose flow")
+                print("ERROR: editor not found")
                 print("URL:", page.url)
-                try:
-                    print("DIAGNOSTICS:", page.evaluate("""() => ({readyState:document.readyState, htmlLength:document.documentElement?.outerHTML?.length||0, bodyChildren:document.body?.children?.length||0})"""))
-                except Exception:
-                    pass
-                page.screenshot(path=str(BASE_DIR / 'debug_manual_no_editor.png'), full_page=True)
+                page.screenshot(path=str(BASE_DIR / 'debug_type_no_editor.png'), full_page=True)
                 while True:
                     time.sleep(60)
 
             print("EDITOR FOUND:", editor.get_attribute('data-testid'))
-            print("ACTIVE ELEMENT BEFORE MANUAL INPUT:", page.evaluate("""() => {
-                const e=document.activeElement;
-                return e ? {tag:e.tagName,testid:e.getAttribute('data-testid'),role:e.getAttribute('role'),editable:e.getAttribute('contenteditable')} : null;
-            }"""))
-            print("\n>>> 现在请你手工点击编辑器，然后输入一个字符，例如 A。")
-            print(">>> 程序不会输入任何字符，也不会点击 Post。")
-            print(">>> 程序每 500ms 检查一次编辑器和 Post 按钮。")
-            print(">>> 浏览器不会自动关闭。按 Ctrl+C 结束。\n")
+            editor.click(timeout=3000)
+            page.wait_for_timeout(300)
+            print("ACTIVE ELEMENT:", page.evaluate("""() => { const e=document.activeElement; return e ? {tag:e.tagName,testid:e.getAttribute('data-testid'),role:e.getAttribute('role'),editable:e.getAttribute('contenteditable')} : null; }"""))
 
+            print("\n[2] Typing with keyboard.type():", TEST_TEXT)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            page.wait_for_timeout(500)
+            page.keyboard.type(TEST_TEXT, delay=120)
+            page.wait_for_timeout(1000)
+
+            editor = find_editor(page)
+            actual = editor_text(editor) if editor else ''
+            button = find_post_button(page)
+            state = button_state(button)
+            print("--- AFTER KEYBOARD.TYPE ---")
+            print("EDITOR TEXT:", repr(actual))
+            print("TEXT VERIFIED:", TEST_TEXT in actual)
+            print("POST BUTTON:", state)
+
+            if TEST_TEXT not in actual:
+                print("STOP: text verification failed. Nothing will be clicked.")
+                page.screenshot(path=str(BASE_DIR / 'debug_type_text_failed.png'), full_page=True)
+                while True:
+                    time.sleep(60)
+
+            print("\n[3] Waiting for X React state to enable Post...")
+            post_enabled = False
+            for attempt in range(40):
+                page.wait_for_timeout(500)
+                button = find_post_button(page)
+                state = button_state(button)
+                print(f"  check {attempt+1}/40:", state)
+                if enabled(state):
+                    post_enabled = True
+                    break
+
+            if not post_enabled:
+                print("STOP: Post remained disabled after keyboard.type(). Nothing will be clicked.")
+                page.screenshot(path=str(BASE_DIR / 'debug_type_post_disabled.png'), full_page=True)
+                while True:
+                    time.sleep(60)
+
+            print("POST BUTTON ENABLED: True")
+            print("\n[4] AUTO CLICKING POST NOW")
+            button.scroll_into_view_if_needed(timeout=2000)
+            button.click(timeout=5000)
+            print("POST CLICK SENT")
+
+            print("\n[5] Monitoring result. Browser will remain open.")
             previous = None
             while True:
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(1000)
                 current = snapshot(page)
-                key = (
-                    current['url'],
-                    current['editor_found'],
-                    current['editor_text'],
-                    repr(current['post_button']),
-                    tuple(current['alerts']),
-                )
+                key = (current['url'], current['editor_found'], current['editor_text'], repr(current['post_button']), tuple(current['alerts']))
                 if key != previous:
-                    print("[PAGE STATE CHANGE]")
+                    print("\n[PAGE STATE CHANGE]")
                     print("URL:", current['url'])
                     print("EDITOR FOUND:", current['editor_found'])
                     print("EDITOR TEXT:", repr(current['editor_text']))
@@ -189,7 +231,7 @@ def main():
         except Exception as e:
             print("UNEXPECTED ERROR:", type(e).__name__, repr(e))
             try:
-                page.screenshot(path=str(BASE_DIR / 'debug_manual_exception.png'), full_page=True)
+                page.screenshot(path=str(BASE_DIR / 'debug_type_exception.png'), full_page=True)
             except Exception:
                 pass
             while True:
