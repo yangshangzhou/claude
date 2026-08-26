@@ -74,7 +74,8 @@ def _find_visible_editor(page):
         }""")
     except Exception:
         return None
-    if not info:return None
+    if not info:
+        return None
     try:
         loc=page.locator(f'[data-testid="{info["testid"]}"]').first if info.get('testid') else page.locator(info['selector']).first
         return loc if _element_visible(loc) else None
@@ -93,9 +94,8 @@ def _focus_editor(page, editor) -> bool:
     try:
         editor.scroll_into_view_if_needed(timeout=1500)
         editor.click(timeout=1500)
-        page.evaluate("el => el.focus()", editor)
-        active = page.evaluate("""() => {const el=document.activeElement;return !!el && (el.getAttribute('data-testid')==='tweetTextarea_0'||el.getAttribute('role')==='textbox'||el.getAttribute('contenteditable')==='true');}""")
-        return bool(active)
+        editor.focus(timeout=1500)
+        return bool(page.evaluate("""() => {const el=document.activeElement;return !!el && (el.getAttribute('data-testid')==='tweetTextarea_0'||el.getAttribute('role')==='textbox'||el.getAttribute('contenteditable')==='true');}"""))
     except Exception:
         return False
 
@@ -104,14 +104,14 @@ def _type_into_editor(page, editor, text: str) -> bool:
     if not _focus_editor(page, editor):
         return False
     try:
-        page.keyboard.insert_text(text)
+        editor.press_sequentially(text, delay=20, timeout=8000)
     except Exception:
         try:
-            editor.press_sequentially(text, delay=15, timeout=6000)
+            page.keyboard.type(text, delay=20)
         except Exception:
             return False
-    page.wait_for_timeout(400)
-    return bool(_editor_text(editor))
+    page.wait_for_timeout(500)
+    return text.strip() in _editor_text(editor)
 
 
 def _find_post_button(page):
@@ -127,15 +127,18 @@ def _find_post_button(page):
         }""")
     except Exception:
         return None
-    if not info:return None
+    if not info:
+        return None
     try:
         if info.get('testid'):
             loc=page.locator(f'[data-testid="{info["testid"]}"]')
             for i in range(min(loc.count(),5)):
                 c=loc.nth(i)
-                if _element_visible(c):return c
+                if _element_visible(c):
+                    return c
         idx=info.get('index',-1)
-        if isinstance(idx,int) and idx>=0:return page.locator('button').nth(idx)
+        if isinstance(idx,int) and idx>=0:
+            return page.locator('button').nth(idx)
     except Exception:
         pass
     return None
@@ -144,7 +147,8 @@ def _find_post_button(page):
 def _find_new_post_button(page):
     try:
         info=page.evaluate("""() => {const sels=['[data-testid="SideNav_NewTweet_Button"]','a[href="/compose/post"]','a[href="/compose/tweet"]'];const v=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0};for(const s of sels){const el=[...document.querySelectorAll(s)].find(v);if(el)return {selector:s};}return null;}""")
-        if not info:return None
+        if not info:
+            return None
         loc=page.locator(info['selector']).first
         return loc if _element_visible(loc) else None
     except Exception:
@@ -153,22 +157,28 @@ def _find_new_post_button(page):
 
 def _diagnostics(page):
     out={"url":page.url if page else "","title":"","ready_state":"","html_length":0,"body_exists":False,"body_children":0,"body":"","test_ids":[]}
-    if not page:return out
-    try:out.update(page.evaluate("() => ({ready_state:document.readyState,html_length:document.documentElement?.outerHTML?.length||0,body_exists:!!document.body,body_children:document.body?.children?.length||0})"))
-    except Exception:pass
-    try:out['title']=page.title()
-    except Exception:pass
-    try:out['body']=page.locator('body').inner_text(timeout=1200)[:2000]
-    except Exception:pass
-    try:out['test_ids']=page.locator('[data-testid]').evaluate_all("els=>Array.from(new Set(els.map(e=>e.getAttribute('data-testid')).filter(Boolean))).slice(0,80)")
-    except Exception:pass
+    if not page:
+        return out
+    try:
+        out.update(page.evaluate("() => ({ready_state:document.readyState,html_length:document.documentElement?.outerHTML?.length||0,body_exists:!!document.body,body_children:document.body?.children?.length||0})"))
+    except Exception:
+        pass
+    try: out['title']=page.title()
+    except Exception: pass
+    try: out['body']=page.locator('body').inner_text(timeout=1200)[:2000]
+    except Exception: pass
+    try: out['test_ids']=page.locator('[data-testid]').evaluate_all("els=>Array.from(new Set(els.map(e=>e.getAttribute('data-testid')).filter(Boolean))).slice(0,80)")
+    except Exception: pass
     return out
 
 
 def _install_lightweight_network_policy(page):
+    # Do not abort images: X needs image resources for the composer/media preview.
     def route_handler(route):
-        if route.request.resource_type in {'image','media','font'}:route.abort()
-        else:route.continue_()
+        if route.request.resource_type in {'media','font'}:
+            route.abort()
+        else:
+            route.continue_()
     page.route('**/*',route_handler)
 
 
@@ -184,19 +194,21 @@ def _wait_for_app(page,started_at,timeout_ms=15000):
     while time.time()<deadline:
         _check_deadline(started_at)
         try:
-            if page.evaluate('() => !!document.body && document.body.children.length>0'):return True
-        except Exception:pass
+            if page.evaluate('() => !!document.body && document.body.children.length>0'):
+                return True
+        except Exception: pass
         page.wait_for_timeout(500)
     return False
 
 
 def _open_compose(page,started_at):
     _set_task(stage='opening_home');page.goto(_HOME_URL,wait_until='domcontentloaded',timeout=20000);_wait_for_app(page,started_at,12000)
-    if _login_state(page) or _onboarding_state(page):return page.url
+    if _login_state(page) or _onboarding_state(page): return page.url
     _set_task(stage='opening_compose');entry=_find_new_post_button(page)
     if entry:
-        try:entry.click(timeout=2500);page.wait_for_timeout(1200);return page.url
-        except Exception:pass
+        try:
+            entry.click(timeout=2500);page.wait_for_timeout(1200);return page.url
+        except Exception: pass
     page.goto(COMPOSE_URL,wait_until='domcontentloaded',timeout=20000);_wait_for_app(page,started_at,12000);return page.url
 
 
@@ -204,94 +216,64 @@ def _wait_for_editor(page,started_at,timeout_ms=12000):
     deadline=time.time()+timeout_ms/1000
     while time.time()<deadline:
         _check_deadline(started_at);ed=_find_visible_editor(page)
-        if ed:return ed
+        if ed: return ed
         page.wait_for_timeout(500)
     return None
 
 
 def _acquire_task(stage):
-    if not _BROWSER_LOCK.acquire(blocking=False):return None,{"success":False,"busy":True,"stage":"lock","message":"Another X browser task is currently running.","task":_task_snapshot()}
+    if not _BROWSER_LOCK.acquire(blocking=False):
+        return None,{"success":False,"busy":True,"stage":"lock","message":"Another X browser task is currently running.","task":_task_snapshot()}
     started_at=time.time();_set_task(busy=True,stage=stage,started_at=started_at,elapsed_seconds=0,text='',last_result=None);return started_at,None
 
 
 def _cleanup_task(started_at,browser,context,state_file):
     if context:
-        try:context.close()
-        except Exception:pass
+        try: context.close()
+        except Exception: pass
     if browser:
-        try:browser.close()
-        except Exception:pass
+        try: browser.close()
+        except Exception: pass
     if state_file:
-        try:os.unlink(state_file)
-        except Exception:pass
-    try:_BROWSER_LOCK.release()
-    except RuntimeError:pass
-    with _TASK_STATE_LOCK:_TASK_STATE.update(busy=False,stage='idle',elapsed_seconds=round(time.time()-started_at,1))
+        try: os.unlink(state_file)
+        except Exception: pass
+    try: _BROWSER_LOCK.release()
+    except RuntimeError: pass
+    with _TASK_STATE_LOCK:
+        _TASK_STATE.update(busy=False,stage='idle',elapsed_seconds=round(time.time()-started_at,1))
 
 
-def _login_state(page):return '/i/flow/login' in page.url or '/login' in page.url
+def _login_state(page): return '/i/flow/login' in page.url or '/login' in page.url
 
-def _onboarding_state(page):return '/i/jf/' in page.url or '/onboarding' in page.url
+def _onboarding_state(page): return '/i/jf/' in page.url or '/onboarding' in page.url
 
 
 def test_x_browser():
     state=_storage_state()
-    if not state:return {'success':False,'stage':'configuration','message':'No X browser session configured.'}
+    if not state: return {'success':False,'stage':'configuration','message':'No X browser session configured.'}
     started,error=_acquire_task('test_starting')
-    if error:return error
+    if error: return error
     b=c=sf=page=None
     try:
         with sync_playwright() as p:
             _set_task(stage='test_launching_browser');b,c,sf,page=_launch_context(p,state);_set_task(stage='test_opening_x');page.goto(_HOME_URL,wait_until='domcontentloaded',timeout=20000);mounted=_wait_for_app(page,started,15000);page.wait_for_timeout(1000);d=_diagnostics(page);lr=_login_state(page);ob=_onboarding_state(page);r={'success':not lr and mounted,'stage':'test_complete' if not lr and mounted else ('login_required' if lr else 'x_dom_not_mounted'),'message':'Playwright launched and X mounted with the saved browser session.' if not lr and mounted else 'X did not finish mounting its web application in the browser.','login_redirect':lr,'onboarding':ob,'diagnostics':d};_set_task(stage=r['stage'],last_result=r);return r
     except Exception as e:
         r={'success':False,'stage':'timeout' if isinstance(e,(TimeoutError,PlaywrightTimeoutError)) else 'exception','message':f'Playwright/X diagnostic failed: {type(e).__name__}: {e}','diagnostics':_diagnostics(page) if page else {}};_set_task(stage='failed',last_result=r);return r
-    finally:_cleanup_task(started,b,c,sf)
+    finally: _cleanup_task(started,b,c,sf)
 
 
 def test_x_compose():
     state=_storage_state()
-    if not state:return {'success':False,'stage':'configuration','message':'No X browser session configured.'}
+    if not state: return {'success':False,'stage':'configuration','message':'No X browser session configured.'}
     started,error=_acquire_task('compose_starting')
-    if error:return error
+    if error: return error
     b=c=sf=page=None
     try:
         with sync_playwright() as p:
             b,c,sf,page=_launch_context(p,state);_open_compose(page,started);lr=_login_state(page);ob=_onboarding_state(page)
-            if lr or ob:return {'success':False,'stage':'login_required','message':'X did not open the compose page in the saved session.','login_redirect':lr,'onboarding':ob,'diagnostics':_diagnostics(page)}
+            if lr or ob: return {'success':False,'stage':'login_required','message':'X did not open the compose page in the saved session.','login_redirect':lr,'onboarding':ob,'diagnostics':_diagnostics(page)}
             _set_task(stage='compose_waiting_editor');editor=_wait_for_editor(page,started,12000);ef=editor is not None;_set_task(stage='compose_checking_post_button');button=_find_post_button(page) if ef else None
             r={'success':ef,'stage':'compose_ready' if ef else 'editor_not_found','message':'X compose UI loaded and the tweet editor was found.' if ef else 'X opened, but the tweet editor was not rendered.','login_redirect':lr,'onboarding':ob,'editor_found':ef,'editor':None if not ef else {'data_testid':editor.get_attribute('data-testid'),'role':editor.get_attribute('role'),'contenteditable':editor.get_attribute('contenteditable')},'post_button_found':button is not None,'post_button':None if button is None else {'data_testid':button.get_attribute('data-testid'),'aria_label':button.get_attribute('aria-label'),'enabled':not button.is_disabled(timeout=800)},'diagnostics':_diagnostics(page)};_set_task(stage=r['stage'],last_result=r);return r
     except Exception as e:
         r={'success':False,'stage':'timeout' if isinstance(e,(TimeoutError,PlaywrightTimeoutError)) else 'exception','message':f'X compose diagnostic failed: {type(e).__name__}: {e}','diagnostics':_diagnostics(page) if page else {}};_set_task(stage='failed',last_result=r);return r
-    finally:_cleanup_task(started,b,c,sf)
-
-
-def post_x(text:str):
-    state=_storage_state()
-    if not state:return browser_status()
-    started,error=_acquire_task('starting_browser')
-    if error:error['text']=text;return error
-    _set_task(text=text);b=c=sf=page=None
-    try:
-        with sync_playwright() as p:
-            b,c,sf,page=_launch_context(p,state);_open_compose(page,started);_check_deadline(started)
-            if _login_state(page):return {'success':False,'message':'X browser session has expired.','diagnostics':_diagnostics(page)}
-            if _onboarding_state(page):return {'success':False,'message':'X opened an onboarding flow instead of the compose page.','diagnostics':_diagnostics(page)}
-            _set_task(stage='waiting_editor');editor=_wait_for_editor(page,started,12000)
-            if editor is None:return {'success':False,'stage':'editor_not_found','message':'X composer did not render a visible editor.','diagnostics':_diagnostics(page)}
-            _set_task(stage='typing')
-            if not _type_into_editor(page,editor,text):
-                r={'success':False,'stage':'typing_failed','message':'X editor was found, but text was not confirmed inside the editor.','editor_text':_editor_text(editor),'diagnostics':_diagnostics(page)};_set_task(stage='failed',last_result=r);return r
-            _set_task(stage='typing_verified');button=None;deadline=time.time()+8
-            while time.time()<deadline:
-                _check_deadline(started);button=_find_post_button(page)
-                if button:break
-                page.wait_for_timeout(300)
-            if button is None:
-                r={'success':False,'stage':'post_button_not_found','message':'Text was verified in the editor, but the Post button was not found or enabled.','editor_text':_editor_text(editor),'diagnostics':_diagnostics(page)};_set_task(stage='failed',last_result=r);return r
-            _set_task(stage='clicking_post');button.scroll_into_view_if_needed(timeout=1500);button.click(timeout=2500);_set_task(stage='verifying_post');page.wait_for_timeout(1200);text_after=_editor_text(editor);alert=''
-            try:alert=(page.locator('[role="alert"]').first.text_content(timeout=800) or '').strip()
-            except Exception:pass
-            success=not text_after;r={'success':success,'stage':'post_complete' if success else 'verification_failed','message':'X post submitted successfully.' if success else 'Post was clicked but the editor still contains text.','verification':{'editor_text_after':text_after[:500],'alert':alert[:500]},'diagnostics':_diagnostics(page)};_set_task(stage=r['stage'],last_result=r);return r
-    except Exception as e:
-        r={'success':False,'stage':'timeout' if isinstance(e,(TimeoutError,PlaywrightTimeoutError)) else 'exception','message':f'X post failed: {type(e).__name__}: {e}','diagnostics':_diagnostics(page) if page else {}};_set_task(stage='failed',last_result=r);return r
-    finally:_cleanup_task(started,b,c,sf)
+    finally: _cleanup_task(started,b,c,sf)
