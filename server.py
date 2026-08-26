@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from browser_x import post_x, browser_status, test_x_browser
+from browser_x import post_x, browser_status, test_x_browser, test_x_compose
 
 app = FastAPI(title="X Post MCP Browser")
 
@@ -26,27 +26,23 @@ def post_status():
 
 @app.get("/mcp/test")
 def test_api():
-    """Fast, side-effect-free diagnostic endpoint.
-
-    This deliberately does not touch Playwright or X. If this returns 200,
-    Render -> Uvicorn -> FastAPI routing is healthy and any remaining failure
-    is downstream of the basic HTTP application layer.
-    """
-    return {
-        "success": True,
-        "message": "FastAPI routing is working.",
-        "playwright_touched": False,
-    }
+    return {"success": True, "message": "FastAPI routing is working.", "playwright_touched": False}
 
 
 @app.get("/mcp/test_x")
 def test_x():
-    """Diagnostic endpoint for Playwright + saved X session.
-
-    This launches Playwright and opens X only. It does NOT open the composer
-    and does NOT create a post.
-    """
     result = test_x_browser()
+    if result.get("success"):
+        return result
+    if result.get("busy"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.get("/mcp/test_compose")
+def test_compose():
+    """Open X compose and inspect the editor/button without typing or posting."""
+    result = test_x_compose()
     if result.get("success"):
         return result
     if result.get("busy"):
@@ -65,11 +61,6 @@ def create_post(post: Post):
     result = post_x(text)
     if result.get("success"):
         return result
-
-    # A second request while Playwright is already processing a post is a
-    # conflict, not a server failure. Returning 409 makes this distinguishable
-    # from a genuine X/Playwright failure (503).
     if result.get("busy"):
         raise HTTPException(status_code=409, detail=result)
-
     raise HTTPException(status_code=503, detail=result)
