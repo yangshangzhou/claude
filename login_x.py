@@ -4,13 +4,19 @@ from playwright.sync_api import sync_playwright
 OUTPUT = Path("x_state.json")
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=False)
+    # Use the user's installed Google Chrome instead of
+    # Playwright's bundled "Chrome for Testing" browser.
+    browser = p.chromium.launch(
+        channel="chrome",
+        headless=False,
+    )
     context = browser.new_context(viewport={"width": 1400, "height": 900})
     page = context.new_page()
     page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded")
 
     print("\nA browser window is open.")
     print("Log in to your X account manually, including any verification steps.")
+    print("If you use Google login, complete the Google window and return to X.")
     input("After you are fully logged in and can see your X home page, press Enter here... ")
 
     context.storage_state(path=str(OUTPUT))
