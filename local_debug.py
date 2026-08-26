@@ -94,7 +94,6 @@ def click_compose_entry(page):
         '[data-testid="SideNav_NewTweet_Button"]',
         'a[href="/compose/post"]',
         'a[href="/compose/tweet"]',
-        '[data-testid="tweetButtonInline"]',
     ]
     for selector in selectors:
         try:
@@ -110,6 +109,76 @@ def click_compose_entry(page):
         except Exception as e:
             print("selector error", selector, repr(e))
     return False
+
+
+def typing_test(page, text="LOCAL_X_TYPING_TEST"):
+    """Find the real X editor, type text, verify it, then inspect Post without clicking."""
+    print("\n========== TYPING TEST (NO POST CLICK) ==========")
+    editor_selector = '[data-testid="tweetTextarea_0"]'
+    editor = page.locator(editor_selector).first
+
+    if editor.count() == 0 or not visible(editor):
+        print("EDITOR NOT FOUND:", editor_selector)
+        return False
+
+    print("EDITOR FOUND:", {
+        "selector": editor_selector,
+        "role": editor.get_attribute("role"),
+        "contenteditable": editor.get_attribute("contenteditable"),
+    })
+
+    try:
+        editor.scroll_into_view_if_needed(timeout=2000)
+        editor.click(timeout=2000)
+        editor.focus(timeout=2000)
+    except Exception as e:
+        print("EDITOR FOCUS FAILED:", repr(e))
+        return False
+
+    active = page.evaluate("""() => {
+        const el = document.activeElement;
+        return {
+            tag: el?.tagName || null,
+            testid: el?.getAttribute('data-testid') || null,
+            role: el?.getAttribute('role') || null,
+            contenteditable: el?.getAttribute('contenteditable') || null
+        };
+    }""")
+    print("ACTIVE ELEMENT:", json.dumps(active, ensure_ascii=False))
+
+    print("Typing:", text)
+    try:
+        editor.press_sequentially(text, delay=30, timeout=8000)
+    except Exception as e:
+        print("PRESS_SEQUENTIALLY FAILED:", repr(e))
+        return False
+
+    page.wait_for_timeout(1000)
+
+    actual = editor.inner_text(timeout=1000).strip()
+    html = editor.inner_html(timeout=1000)
+    print("EDITOR TEXT AFTER TYPING:", repr(actual))
+    print("TEXT VERIFIED:", text in actual)
+    print("EDITOR HTML:", html[:1000])
+
+    # Only AFTER text is verified do we inspect the Post button.
+    button = page.locator('[data-testid="tweetButtonInline"]').first
+    if button.count() == 0:
+        button = page.locator('[data-testid="tweetButton"]').first
+    print("POST BUTTON COUNT:", button.count())
+    if button.count() > 0 and visible(button):
+        print("POST BUTTON:", {
+            "testid": button.get_attribute("data-testid"),
+            "aria_label": button.get_attribute("aria-label"),
+            "disabled": button.is_disabled(timeout=1000),
+        })
+    else:
+        print("POST BUTTON NOT FOUND/NOT VISIBLE")
+
+    print("IMPORTANT: Post button was NOT clicked.")
+    page.screenshot(path=str(BASE_DIR / "debug_after_typing.png"), full_page=True)
+    print("Screenshot: debug_after_typing.png")
+    return text in actual
 
 
 def main():
@@ -146,48 +215,28 @@ def main():
         page.set_default_timeout(5000)
 
         try:
-            print("\n[1/5] Opening X home...")
+            print("\n[1/4] Opening X home...")
             page.goto(HOME_URL, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(5000)
             dump_dom(page, "HOME")
             page.screenshot(path=str(BASE_DIR / "debug_home.png"), full_page=True)
-            print("Screenshot: debug_home.png")
 
-            print("\n[2/5] Looking for compose entry...")
+            print("\n[2/4] Opening compose...")
             clicked = click_compose_entry(page)
             print("Compose entry clicked:", clicked)
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(3000)
             dump_dom(page, "AFTER_COMPOSE_ENTRY")
-            page.screenshot(path=str(BASE_DIR / "debug_after_compose.png"), full_page=True)
-            print("Screenshot: debug_after_compose.png")
 
-            print("\n[3/5] Opening direct compose URL as comparison...")
+            print("\n[3/4] Direct compose URL comparison...")
             page.goto(COMPOSE_URL, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(5000)
             dump_dom(page, "DIRECT_COMPOSE_URL")
-            page.screenshot(path=str(BASE_DIR / "debug_direct_compose.png"), full_page=True)
-            print("Screenshot: debug_direct_compose.png")
 
-            print("\n[4/5] Checking likely editor selectors...")
-            selectors = [
-                '[data-testid="tweetTextarea_0"]',
-                'div[contenteditable="true"][role="textbox"]',
-                '[role="textbox"][contenteditable="true"]',
-                '[contenteditable="true"]',
-                'textarea',
-            ]
-            for selector in selectors:
-                try:
-                    loc = page.locator(selector)
-                    print(selector, "count=", loc.count())
-                    for i in range(min(loc.count(), 5)):
-                        print("  ", i, "visible=", visible(loc.nth(i)))
-                except Exception as e:
-                    print(selector, "ERROR", repr(e))
-
-            print("\n[5/5] Diagnostic complete.")
-            print("The browser will remain open for 10 seconds so you can inspect it.")
-            time.sleep(10)
+            print("\n[4/4] REAL EDITOR TYPING TEST...")
+            ok = typing_test(page, "LOCAL_X_TYPING_TEST_123")
+            print("\nFINAL TYPING RESULT:", ok)
+            print("The browser will remain open for 30 seconds. Do NOT click Post manually during this test.")
+            time.sleep(30)
         except PlaywrightTimeoutError as e:
             print("PLAYWRIGHT TIMEOUT:", repr(e))
         except Exception as e:
