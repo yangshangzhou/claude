@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from browser_x import post_x, browser_status, test_x_browser, test_x_compose
+from browser_x import browser_status, test_x_browser, test_x_compose
+from browser_x_fix import post_x, test_x_typing
 
 app = FastAPI(title="X Post MCP Browser")
 
@@ -43,6 +44,17 @@ def test_x():
 def test_compose():
     """Open X compose and inspect the editor/button without typing or posting."""
     result = test_x_compose()
+    if result.get("success"):
+        return result
+    if result.get("busy"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.get("/mcp/test_typing")
+def test_typing(text: str = "LOCAL_X_TYPING_TEST"):
+    """Open X composer, type text, verify it, inspect Post button, never click Post."""
+    result = test_x_typing(text)
     if result.get("success"):
         return result
     if result.get("busy"):
