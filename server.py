@@ -8,6 +8,8 @@ app = FastAPI(title="X Post MCP Browser")
 
 class Post(BaseModel):
     text: str
+    image_base64: str | None = None
+    image_filename: str = "image.png"
 
 
 @app.get("/")
@@ -69,8 +71,11 @@ def create_post(post: Post):
         raise HTTPException(status_code=422, detail="text cannot be empty")
     if len(text) > 280:
         raise HTTPException(status_code=422, detail="X post is limited to 280 characters")
-
-    result = post_x(text)
+    if post.image_base64:
+        # The browser layer performs the actual byte-size/type validation.
+        result = post_x(text, image_base64=post.image_base64, image_filename=post.image_filename)
+    else:
+        result = post_x(text)
     if result.get("success"):
         return result
     if result.get("busy"):
