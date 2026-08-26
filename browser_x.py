@@ -8,6 +8,7 @@ from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 COMPOSE_URL = "https://x.com/compose/tweet"
+_HOME_URL = "https://x.com/home"
 _BROWSER_LOCK = threading.Lock()
 _TASK_STATE_LOCK = threading.Lock()
 _TASK_STATE: dict[str, Any] = {
@@ -134,6 +135,130 @@ def _install_lightweight_network_policy(page) -> None:
         else:
             route.continue_()
     page.route("**/*", handle_route)
+
+
+def test_x_browser() -> dict[str, Any]:
+    """Diagnostic only: launch Playwright with the saved X session and open X.
+
+    This never opens the composer and never posts anything. It is intended to
+    separate Playwright/browser/session problems from the create_post workflow.
+    """
+    state = _storage_state()
+    if not state:
+        return {
+            "success": False,
+            "stage": "configuration",
+            "message": "No X browser session configured.",
+        }
+
+    if not _BROWSER_LOCK.acquire(blocking=False):
+        return {
+            "success": False,
+            "busy": True,
+            "stage": "lock",
+            "message": "Another X browser task is currently running.",
+            "task": _task_snapshot(),
+        }
+
+    started_at = time.time()
+    _set_task(busy=True, stage="test_starting", started_at=started_at, elapsed_seconds=0, text="", last_result=None)
+    browser = None
+    context = None
+    state_file = None
+    page = None
+    try:
+        with sync_playwright() as p:
+            _set_task(stage="test_launching_browser")
+            browser = p.chromium.launch(
+                headless=True,
+                timeout=20000,
+                args=[
+                    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                    "--disable-gpu", "--disable-software-rasterizer", "--disable-background-networking",
+                    "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+                    "--disable-breakpad", "--disable-component-update", "--disable-default-apps",
+                    "--disable-extensions", "--disable-plugins", "--disable-sync", "--disable-translate",
+                    "--disable-features=Translate,BackForwardCache", "--mute-audio", "--no-first-run",
+                    "--no-default-browser-check", "--no-zygote", "--renderer-process-limit=1",
+                    "--js-flags=--max-old-space-size=96",
+                ],
+            )
+
+            _set_task(stage="test_creating_context")
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+                f.write(state)
+                state_file = f.name
+            context = browser.new_context(
+                storage_state=state_file,
+                viewport={"width": 900, "height": 650},
+                locale="en-US",
+            )
+            page = context.new_page()
+            page.set_default_timeout(8000)
+            _install_lightweight_network_policy(page)
+
+            _set_task(stage="test_opening_x")
+            page.goto(_HOME_URL, wait_until="commit", timeout=20000)
+            page.wait_for_timeout(3000)
+
+            diagnostics = _diagnostics(page)
+            current_url = page.url
+            login_redirect = "/i/flow/login" in current_url or "/login" in current_url
+            onboarding = "/i/jf/" in current_url or "/onboarding" in current_url
+
+            result = {
+                "success": not login_redirect,
+                "stage": "test_complete" if not login_redirect else "login_required",
+                "message": (
+                    "Playwright can launch and X opened with the saved browser session."
+                    if not login_redirect
+                    else "Playwright launched, but X redirected to a login flow; the saved session is not authenticated."
+                ),
+                "login_redirect": login_redirect,
+                "onboarding": onboarding,
+                "diagnostics": diagnostics,
+            }
+            _set_task(stage=result["stage"], last_result=result)
+            return result
+
+    except PlaywrightTimeoutError as exc:
+        result = {
+            "success": False,
+            "stage": "timeout",
+            "message": f"Playwright/X diagnostic timed out: {exc}",
+            "diagnostics": _diagnostics(page) if page else {},
+        }
+        _set_task(stage="failed", last_result=result)
+        return result
+    except Exception as exc:
+        result = {
+            "success": False,
+            "stage": "exception",
+            "message": f"Playwright/X diagnostic failed: {type(exc).__name__}: {exc}",
+            "diagnostics": _diagnostics(page) if page else {},
+        }
+        _set_task(stage="failed", last_result=result)
+        return result
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if state_file:
+            try:
+                os.unlink(state_file)
+            except Exception:
+                pass
+        _BROWSER_LOCK.release()
+        with _TASK_STATE_LOCK:
+            _TASK_STATE["busy"] = False
+            _TASK_STATE["elapsed_seconds"] = round(time.time() - started_at, 1)
 
 
 def post_x(text: str) -> dict[str, Any]:
