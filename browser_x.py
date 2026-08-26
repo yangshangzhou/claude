@@ -51,44 +51,52 @@ def browser_status() -> dict[str, Any]:
 
 def _find_visible_editor(page):
     selectors = ['[data-testid="tweetTextarea_0"]', 'div[contenteditable="true"][role="textbox"]', '[role="textbox"][contenteditable="true"]']
-    for scope in (page.locator('[role="dialog"]'), page.locator('body')):
+    for selector in selectors:
         try:
-            if not scope.is_visible():
-                continue
+            loc = page.locator(selector)
+            count = min(loc.count(), 10)
+            for i in range(count):
+                candidate = loc.nth(i)
+                if candidate.is_visible():
+                    return candidate
         except Exception:
-            pass
-        for selector in selectors:
-            try:
-                loc = scope.locator(selector)
-                for i in range(min(loc.count(), 10)):
-                    candidate = loc.nth(i)
-                    if candidate.is_visible():
-                        return candidate
-            except Exception:
-                pass
+            continue
     return None
 
 
 def _find_post_button(page):
-    selectors = ['[data-testid="tweetButton"]', '[data-testid="tweetButtonInline"]', 'button[aria-label="Post"]', 'button[aria-label="Tweet"]']
-    for scope in (page.locator('[role="dialog"]'), page.locator('body')):
-        for selector in selectors:
-            try:
-                loc = scope.locator(selector)
-                for i in range(min(loc.count(), 10)):
-                    candidate = loc.nth(i)
-                    if candidate.is_visible() and candidate.is_enabled():
-                        return candidate
-            except Exception:
-                pass
+    """Fast X Post button lookup. Avoid broad body scans and role queries."""
+    selectors = [
+        '[data-testid="tweetButton"]',
+        '[data-testid="tweetButtonInline"]',
+        '[data-testid="tweetButton"]:visible',
+        '[data-testid="tweetButtonInline"]:visible',
+    ]
+    for selector in selectors:
         try:
-            loc = scope.get_by_role("button", name="Post", exact=True)
-            for i in range(min(loc.count(), 10)):
+            loc = page.locator(selector)
+            count = min(loc.count(), 5)
+            for i in range(count):
                 candidate = loc.nth(i)
                 if candidate.is_visible() and candidate.is_enabled():
                     return candidate
         except Exception:
-            pass
+            continue
+    # Only if testids are unavailable, use a narrowly scoped visible button query.
+    try:
+        loc = page.locator('button:visible')
+        count = min(loc.count(), 80)
+        for i in range(count):
+            candidate = loc.nth(i)
+            try:
+                aria = candidate.get_attribute("aria-label")
+                text = (candidate.inner_text(timeout=300) or "").strip()
+                if (aria in {"Post", "Tweet"} or text in {"Post", "Tweet"}) and candidate.is_enabled():
+                    return candidate
+            except Exception:
+                continue
+    except Exception:
+        pass
     return None
 
 
@@ -122,7 +130,7 @@ def _launch_context(p, state: str):
     state_file.close()
     context = browser.new_context(storage_state=state_file.name, viewport={"width": 900, "height": 650}, locale="en-US")
     page = context.new_page()
-    page.set_default_timeout(8000)
+    page.set_default_timeout(5000)
     _install_lightweight_network_policy(page)
     return browser, context, state_file.name, page
 
@@ -145,9 +153,13 @@ def _cleanup_task(started_at, browser, context, state_file):
     if state_file:
         try: os.unlink(state_file)
         except Exception: pass
-    _BROWSER_LOCK.release()
+    try:
+        _BROWSER_LOCK.release()
+    except RuntimeError:
+        pass
     with _TASK_STATE_LOCK:
         _TASK_STATE["busy"] = False
+        _TASK_STATE["stage"] = "idle"
         _TASK_STATE["elapsed_seconds"] = round(time.time() - started_at, 1)
 
 
@@ -204,7 +216,7 @@ def test_x_compose() -> dict[str, Any]:
             browser, context, state_file, page = _launch_context(p, state)
             _set_task(stage="compose_opening_x")
             page.goto(COMPOSE_URL, wait_until="commit", timeout=20000)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(2500)
             current_url = page.url
             login_redirect = "/i/flow/login" in current_url or "/login" in current_url
             onboarding = "/i/jf/" in current_url or "/onboarding" in current_url
