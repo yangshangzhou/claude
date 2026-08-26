@@ -51,5 +51,5 @@ def x_status() -> dict[str, Any]:
     return browser_status()
 
 
-# The parent FastAPI app mounts this ASGI application at /mcp.
-mcp_app = mcp.streamable_http_app()
+# server.py mounts this ASGI application at /mcp, so the MCP endpoint is exactly /mcp.
+mcp_app = mcp.streamable_http_app(streamable_http_path="/")
