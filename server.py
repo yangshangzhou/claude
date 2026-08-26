@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from browser_x import post_x, browser_status
+from browser_x import post_x, browser_status, test_x_browser
 
 app = FastAPI(title="X Post MCP Browser")
 
@@ -37,6 +37,21 @@ def test_api():
         "message": "FastAPI routing is working.",
         "playwright_touched": False,
     }
+
+
+@app.get("/mcp/test_x")
+def test_x():
+    """Diagnostic endpoint for Playwright + saved X session.
+
+    This launches Playwright and opens X only. It does NOT open the composer
+    and does NOT create a post.
+    """
+    result = test_x_browser()
+    if result.get("success"):
+        return result
+    if result.get("busy"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @app.post("/mcp/create_post")
