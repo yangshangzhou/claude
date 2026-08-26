@@ -36,55 +36,80 @@ def _find_visible_editor(page):
     selectors = [
         '[data-testid="tweetTextarea_0"]',
         'div[contenteditable="true"][role="textbox"]',
-        'textarea[aria-label*="Post"]',
-        'div[contenteditable="true"]',
         '[role="textbox"][contenteditable="true"]',
     ]
-    for selector in selectors:
+
+    # Prefer the composer inside the X modal/dialog when it exists.
+    for scope in (page.locator('[role="dialog"]'), page.locator('body')):
         try:
-            loc = page.locator(selector)
-            for i in range(min(loc.count(), 10)):
-                candidate = loc.nth(i)
-                if candidate.is_visible():
-                    return candidate
+            if not scope.is_visible():
+                continue
         except Exception:
             pass
+
+        for selector in selectors:
+            try:
+                loc = scope.locator(selector)
+                for i in range(min(loc.count(), 10)):
+                    candidate = loc.nth(i)
+                    if candidate.is_visible():
+                        return candidate
+            except Exception:
+                pass
+
     return None
 
 
 def _find_post_button(page):
     selectors = [
-        '[data-testid="tweetButtonInline"]',
         '[data-testid="tweetButton"]',
+        '[data-testid="tweetButtonInline"]',
         'button[aria-label="Post"]',
+        'button[aria-label="Tweet"]',
     ]
-    for selector in selectors:
+
+    for scope in (page.locator('[role="dialog"]'), page.locator('body')):
+        for selector in selectors:
+            try:
+                loc = scope.locator(selector)
+                for i in range(min(loc.count(), 10)):
+                    candidate = loc.nth(i)
+                    if candidate.is_visible() and candidate.is_enabled():
+                        return candidate
+            except Exception:
+                pass
+
         try:
-            loc = page.locator(selector)
+            loc = scope.get_by_role("button", name="Post", exact=True)
             for i in range(min(loc.count(), 10)):
                 candidate = loc.nth(i)
                 if candidate.is_visible() and candidate.is_enabled():
                     return candidate
         except Exception:
             pass
-    try:
-        loc = page.get_by_role("button", name="Post", exact=True)
-        for i in range(min(loc.count(), 10)):
-            candidate = loc.nth(i)
-            if candidate.is_visible() and candidate.is_enabled():
-                return candidate
-    except Exception:
-        pass
+
     return None
 
 
 def _diagnostics(page) -> dict[str, Any]:
     body_text = ""
+    test_ids: list[str] = []
     try:
-        body_text = page.locator("body").inner_text(timeout=1500)[:1500]
+        body_text = page.locator("body").inner_text(timeout=1500)[:2000]
     except Exception:
         pass
-    return {"url": page.url, "title": page.title(), "body": body_text}
+    try:
+        test_ids = page.locator("[data-testid]").evaluate_all(
+            "els => Array.from(new Set(els.map(e => e.getAttribute('data-testid')).filter(Boolean))).slice(0, 80)"
+        )
+    except Exception:
+        pass
+    return {
+        "url": page.url,
+        "title": page.title(),
+        "body": body_text,
+        "test_ids": test_ids,
+    }
 
 
 def post_x(text: str) -> dict[str, Any]:
@@ -93,21 +118,35 @@ def post_x(text: str) -> dict[str, Any]:
         return browser_status()
 
     with sync_playwright() as p:
-        # Render/Linux: use the newer Chromium headless mode and the flags
-        # commonly required for Chromium inside containers.
-        browser = p.chromium.launch(
-            headless=True,
-            channel="chromium",
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        browser = None
         context = None
         state_file = None
         page = None
         try:
+            # Keep Chromium lightweight enough for Render Free (512 MB RAM).
+            browser = p.chromium.launch(
+                headless=True,
+                channel="chromium",
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-breakpad",
+                    "--disable-component-update",
+                    "--disable-default-apps",
+                    "--disable-extensions",
+                    "--disable-features=Translate,BackForwardCache",
+                    "--disable-sync",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+
             with tempfile.NamedTemporaryFile(
                 "w", suffix=".json", delete=False, encoding="utf-8"
             ) as f:
@@ -125,23 +164,17 @@ def post_x(text: str) -> dict[str, Any]:
                 ),
             )
             page = context.new_page()
-            page.set_default_timeout(7000)
+            page.set_default_timeout(6000)
 
-            # Try the compose route first. If X does not hydrate it, fall back
-            # to Home and its compose control.
-            try:
-                page.goto(
-                    "https://x.com/compose/post",
-                    wait_until="commit",
-                    timeout=12000,
-                )
-                page.wait_for_timeout(2500)
-            except PlaywrightTimeoutError:
-                return {
-                    "success": False,
-                    "message": "X compose navigation timed out.",
-                    "diagnostics": _diagnostics(page),
-                }
+            # IMPORTANT: use /compose/tweet rather than /compose/post.
+            # Current X automation reports show /compose/post/home can fail
+            # to hydrate while /compose/tweet can still open the composer.
+            page.goto(
+                "https://x.com/compose/tweet",
+                wait_until="commit",
+                timeout=10000,
+            )
+            page.wait_for_timeout(3000)
 
             if "/i/flow/login" in page.url or "/login" in page.url:
                 return {
@@ -151,60 +184,32 @@ def post_x(text: str) -> dict[str, Any]:
                 }
 
             editor = _find_visible_editor(page)
-
-            if editor is None:
-                try:
-                    page.goto(
-                        "https://x.com/home",
-                        wait_until="commit",
-                        timeout=12000,
-                    )
-                    page.wait_for_timeout(2500)
-                except PlaywrightTimeoutError:
-                    return {
-                        "success": False,
-                        "message": "X Home navigation timed out.",
-                        "diagnostics": _diagnostics(page),
-                    }
-                editor = _find_visible_editor(page)
-
-            if editor is None:
-                for selector in (
-                    'a[href="/compose/post"]',
-                    '[data-testid="SideNav_NewTweet_Button"]',
-                ):
-                    try:
-                        loc = page.locator(selector).first
-                        if loc.count() and loc.is_visible():
-                            loc.click()
-                            page.wait_for_timeout(2000)
-                            editor = _find_visible_editor(page)
-                            if editor is not None:
-                                break
-                    except Exception:
-                        pass
-
             if editor is None:
                 return {
                     "success": False,
-                    "message": "X compose editor was not rendered. The session is configured, but X web UI did not hydrate in this Render browser.",
+                    "message": "X compose/tweet loaded, but the tweet editor was not rendered.",
                     "diagnostics": _diagnostics(page),
                 }
 
             editor.click()
-            editor.fill(text)
+
+            # X's current composer can ignore programmatic fill(). Use real
+            # keyboard input instead so the React editor receives input events.
+            editor.press_sequentially(text, delay=8)
+            page.wait_for_timeout(500)
 
             button = _find_post_button(page)
             if button is None:
                 return {
                     "success": False,
-                    "message": "X editor was found, but the Post button was not rendered.",
+                    "message": "X editor was found and text was typed, but the Post button was not enabled/rendered.",
                     "diagnostics": _diagnostics(page),
                 }
 
             button.click()
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(3000)
 
+            # Successful submission normally closes the compose modal.
             if _find_visible_editor(page) is None:
                 return {
                     "success": True,
@@ -212,10 +217,11 @@ def post_x(text: str) -> dict[str, Any]:
                     "url": page.url,
                 }
 
+            # Do not claim success if the composer is still open.
             return {
-                "success": True,
-                "message": "Post submission command completed through X web browser automation.",
-                "url": page.url,
+                "success": False,
+                "message": "X Post button was clicked, but the composer is still open; submission could not be verified.",
+                "diagnostics": _diagnostics(page),
             }
 
         except PlaywrightTimeoutError as exc:
@@ -232,8 +238,15 @@ def post_x(text: str) -> dict[str, Any]:
             }
         finally:
             if context is not None:
-                context.close()
-            browser.close()
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
             if state_file:
                 try:
                     os.unlink(state_file)
