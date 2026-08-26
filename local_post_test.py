@@ -6,6 +6,7 @@ from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "x_state.json"
+HOME_URL = "https://x.com/home"
 COMPOSE_URL = "https://x.com/compose/tweet"
 
 
@@ -74,6 +75,24 @@ def snapshot(page):
     }
 
 
+def find_compose_entry(page):
+    selectors = [
+        '[data-testid="SideNav_NewTweet_Button"]',
+        'a[href="/compose/post"]',
+        'a[href="/compose/tweet"]',
+    ]
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            for i in range(min(loc.count(), 10)):
+                el = loc.nth(i)
+                if visible(el):
+                    return el
+        except Exception:
+            pass
+    return None
+
+
 def main():
     print("X local MANUAL typing diagnostic")
     print("Program will NOT type, fill, click Post, or close the browser automatically.")
@@ -104,13 +123,33 @@ def main():
         page.set_default_timeout(5000)
 
         try:
-            print("\n[1] Opening X compose...")
-            page.goto(COMPOSE_URL, wait_until='domcontentloaded', timeout=20000)
+            print("\n[1] Opening X home...")
+            page.goto(HOME_URL, wait_until='domcontentloaded', timeout=20000)
             page.wait_for_timeout(5000)
 
             editor = find_editor(page)
             if editor is None:
-                print("ERROR: editor not found")
+                entry = find_compose_entry(page)
+                print("HOME EDITOR FOUND:", bool(editor))
+                print("COMPOSE ENTRY FOUND:", bool(entry))
+                if entry:
+                    print("Clicking X compose entry...")
+                    entry.click(timeout=3000)
+                    page.wait_for_timeout(3000)
+                else:
+                    print("No compose entry found. Trying direct compose URL as fallback...")
+                    page.goto(COMPOSE_URL, wait_until='domcontentloaded', timeout=20000)
+                    page.wait_for_timeout(5000)
+
+                editor = find_editor(page)
+
+            if editor is None:
+                print("ERROR: editor not found after home->compose flow")
+                print("URL:", page.url)
+                try:
+                    print("DIAGNOSTICS:", page.evaluate("""() => ({readyState:document.readyState, htmlLength:document.documentElement?.outerHTML?.length||0, bodyChildren:document.body?.children?.length||0})"""))
+                except Exception:
+                    pass
                 page.screenshot(path=str(BASE_DIR / 'debug_manual_no_editor.png'), full_page=True)
                 while True:
                     time.sleep(60)
