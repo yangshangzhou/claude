@@ -57,7 +57,10 @@ with sync_playwright() as p:
 
     context = browser.contexts[0]
     page = context.pages[0] if context.pages else context.new_page()
-    page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded")
+
+    # Only navigate to the login page when we are not already on X.
+    if "x.com" not in page.url:
+        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded")
 
     print("\n========================================")
     print("X login window is open.")
@@ -67,16 +70,18 @@ with sync_playwright() as p:
 
     input("After you are fully logged in and can see your X home page, press Enter here... ")
 
-    # Verify that the session is actually logged in before saving it.
-    page.goto("https://x.com/home", wait_until="domcontentloaded")
-    time.sleep(3)
+    # Do NOT navigate to /home here.
+    # X may already be navigating to /home, and forcing another navigation
+    # can cause Playwright's 'Navigation is interrupted by another navigation' error.
+    time.sleep(5)
     print(f"Current URL: {page.url}")
 
-    if "/home" not in page.url:
+    if "/home" not in page.url and page.url.rstrip("/") != "https://x.com":
         raise RuntimeError(
-            "X login was not completed. Please make sure you can see the X home page, then run the script again."
+            f"X login was not completed. Current URL: {page.url}"
         )
 
+    # Save the authenticated browser session.
     context.storage_state(path=str(OUTPUT))
     print(f"\nSUCCESS: Saved browser session to: {OUTPUT.resolve()}")
     print("IMPORTANT: x_state.json contains authentication cookies. Do not commit or share it.")
