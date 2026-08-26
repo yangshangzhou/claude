@@ -13,7 +13,11 @@ TEST_TEXT = "LOCAL_X_POST_CLICK_TEST_123"
 
 def visible(el):
     try:
-        return bool(el.evaluate("""el => { const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; }""", timeout=1000))
+        return bool(el.evaluate("""el => {
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        }""", timeout=1000))
     except Exception:
         return False
 
@@ -26,7 +30,12 @@ def editor_text(editor):
 
 
 def find_editor(page):
-    for selector in ['[data-testid="tweetTextarea_0"]','[contenteditable="true"][role="textbox"]','[contenteditable="true"]']:
+    selectors = [
+        '[data-testid="tweetTextarea_0"]',
+        '[contenteditable="true"][role="textbox"]',
+        '[contenteditable="true"]',
+    ]
+    for selector in selectors:
         loc = page.locator(selector)
         for i in range(min(loc.count(), 10)):
             el = loc.nth(i)
@@ -36,12 +45,13 @@ def find_editor(page):
 
 
 def find_post_button(page):
-    for selector in ['[data-testid="tweetButtonInline"]','[data-testid="tweetButton"]']:
+    for selector in ['[data-testid="tweetButtonInline"]', '[data-testid="tweetButton"]']:
         loc = page.locator(selector)
         for i in range(min(loc.count(), 10)):
             el = loc.nth(i)
             if visible(el):
                 return el
+
     buttons = page.locator('button')
     for i in range(min(buttons.count(), 200)):
         el = buttons.nth(i)
@@ -50,7 +60,7 @@ def find_post_button(page):
         try:
             aria = (el.get_attribute('aria-label') or '').strip()
             text = (el.inner_text(timeout=300) or '').strip()
-            if aria in {'Post','Tweet'} or text in {'Post','Tweet'}:
+            if aria in {'Post', 'Tweet'} or text in {'Post', 'Tweet'}:
                 return el
         except Exception:
             pass
@@ -72,11 +82,30 @@ def button_state(button):
         return {'error': repr(e)}
 
 
+def button_enabled(state):
+    if not state or 'error' in state:
+        return False
+    return state.get('disabled') is False and state.get('aria_disabled') != 'true'
+
+
+def print_state(page, label):
+    editor = find_editor(page)
+    button = find_post_button(page)
+    text = editor_text(editor) if editor else ''
+    state = button_state(button)
+    print(f"\n--- {label} ---")
+    print("URL:", page.url)
+    print("EDITOR FOUND:", bool(editor))
+    print("EDITOR TEXT:", repr(text))
+    print("POST BUTTON:", state)
+    return editor, button, text, state
+
+
 def main():
-    print("X local POST diagnostic - BROWSER WILL STAY OPEN")
-    print("IMPORTANT: this version types the test text but NEVER clicks Post automatically.")
-    print("After typing is verified, click Post manually if you want.")
-    print("The browser stays open until you press Ctrl+C in this terminal.")
+    print("X local POST diagnostic - AUTO CLICK ENABLED")
+    print("The script will type the test text, verify it, wait for X to enable Post, then click Post automatically.")
+    print("The browser will remain open after the click so we can inspect the result.")
+    print("Press Ctrl+C when you want to stop the test.")
 
     if not STATE_FILE.exists():
         print("ERROR: x_state.json not found.")
@@ -84,8 +113,16 @@ def main():
     json.loads(STATE_FILE.read_text(encoding='utf-8'))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, timeout=20000, args=["--disable-gpu", "--disable-dev-shm-usage"])
-        context = browser.new_context(storage_state=str(STATE_FILE), viewport={"width":1440,"height":1000}, locale='en-US')
+        browser = p.chromium.launch(
+            headless=False,
+            timeout=20000,
+            args=["--disable-gpu", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            storage_state=str(STATE_FILE),
+            viewport={"width": 1440, "height": 1000},
+            locale='en-US',
+        )
         page = context.new_page()
         page.set_default_timeout(5000)
 
@@ -101,29 +138,58 @@ def main():
                 while True:
                     time.sleep(60)
 
-            print("EDITOR FOUND")
+            print("EDITOR FOUND:", editor.get_attribute('data-testid'))
             editor.scroll_into_view_if_needed(timeout=2000)
             editor.click(timeout=2000)
             editor.focus(timeout=2000)
 
-            print("[2] Type:", TEST_TEXT)
-            editor.press_sequentially(TEST_TEXT, delay=30, timeout=8000)
-            page.wait_for_timeout(1000)
+            # Important: use Playwright fill() for contenteditable so the browser
+            # dispatches the input events that X/React uses to enable the Post button.
+            print("[2] Fill:", TEST_TEXT)
+            editor.fill(TEST_TEXT, timeout=8000)
+            page.wait_for_timeout(1500)
 
-            editor = find_editor(page)
-            actual = editor_text(editor) if editor else ''
-            button = find_post_button(page)
-            state = button_state(button)
-            print("EDITOR TEXT:", repr(actual))
-            print("TEXT VERIFIED:", TEST_TEXT in actual)
-            print("POST BUTTON:", state)
-            print("\n>>> 浏览器保持打开。现在你可以手工点击 Post。")
-            print(">>> 程序不会自动点击，也不会自动关闭浏览器。")
-            print(">>> 点击之后程序会继续监测页面变化、编辑器和错误提示。")
+            editor, button, actual, state = print_state(page, "AFTER FILL")
 
+            if TEST_TEXT not in actual:
+                print("STOP: text verification failed. Nothing will be clicked.")
+                page.screenshot(path=str(BASE_DIR / 'debug_post_typing_failed.png'), full_page=True)
+                while True:
+                    time.sleep(60)
+
+            print("TEXT VERIFIED: True")
+            print("POST BUTTON AFTER FILL:", state)
+
+            # Give X a few seconds to update React state. Do not click a disabled button.
+            print("[3] Waiting for X to enable Post...")
+            enabled = False
+            for attempt in range(20):
+                page.wait_for_timeout(500)
+                button = find_post_button(page)
+                state = button_state(button)
+                print(f"  check {attempt + 1}/20:", state)
+                if button_enabled(state):
+                    enabled = True
+                    break
+
+            if not enabled:
+                print("STOP: X kept Post disabled. Nothing will be clicked.")
+                print("This means the text is visible in the DOM, but X has not accepted it as a valid compose input.")
+                page.screenshot(path=str(BASE_DIR / 'debug_post_button_disabled.png'), full_page=True)
+                while True:
+                    time.sleep(60)
+
+            print("POST BUTTON ENABLED: True")
+            print("[4] AUTO CLICKING POST NOW")
+            button.scroll_into_view_if_needed(timeout=2000)
+            button.click(timeout=5000)
+            print("POST CLICK SENT")
+
+            # Keep browser alive and observe the result. Do not close automatically.
             previous = None
-            while True:
-                time.sleep(1)
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                page.wait_for_timeout(1000)
                 try:
                     editor = find_editor(page)
                     button = find_post_button(page)
@@ -144,8 +210,11 @@ def main():
                         previous = current
                 except Exception as e:
                     print("\nBROWSER/PLAYWRIGHT EVENT:", type(e).__name__, repr(e))
-                    print("Browser will remain open.")
-                    time.sleep(2)
+
+            print("\n=== POST CLICK TEST FINISHED ===")
+            print("Browser remains open. Press Ctrl+C to close it.")
+            while True:
+                time.sleep(60)
 
         except KeyboardInterrupt:
             print("\nCtrl+C received. Closing browser now.")
