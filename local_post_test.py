@@ -1,13 +1,11 @@
 import json
 import sys
-import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "x_state.json"
-HOME_URL = "https://x.com/home"
 COMPOSE_URL = "https://x.com/compose/tweet"
 TEST_TEXT = "LOCAL_X_POST_CLICK_TEST_123"
 
@@ -169,15 +167,18 @@ def main():
 
             page.screenshot(path=str(BASE_DIR / 'debug_after_post_click.png'), full_page=True)
             print("Screenshot: debug_after_post_click.png")
-            print("Browser remains open for 20 seconds.")
-            time.sleep(20)
+
+            # No timer. Keep the browser open until the user explicitly finishes inspection.
+            input("\n测试已经执行完毕。浏览器不会自动关闭；检查完成后按 Enter 关闭浏览器：")
 
         except PlaywrightTimeoutError as e:
             print("PLAYWRIGHT TIMEOUT:", repr(e))
             page.screenshot(path=str(BASE_DIR / 'debug_post_timeout.png'), full_page=True)
+            input("\n发生 Playwright 超时。浏览器保持打开；检查完成后按 Enter 关闭：")
         except Exception as e:
             print("UNEXPECTED ERROR:", type(e).__name__, repr(e))
             page.screenshot(path=str(BASE_DIR / 'debug_post_exception.png'), full_page=True)
+            input("\n发生异常。浏览器保持打开；检查完成后按 Enter 关闭：")
         finally:
             context.close()
             browser.close()
