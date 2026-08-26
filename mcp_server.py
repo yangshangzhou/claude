@@ -2,7 +2,7 @@ import base64
 import os
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 from browser_x_fix import post_x
@@ -15,16 +15,17 @@ security = TransportSecuritySettings(
     allowed_origins=[f"https://{PUBLIC_HOST}"],
 )
 
-mcp = FastMCP(
-    "X Browser MCP",
-    stateless_http=True,
-    json_response=True,
-    transport_security=security,
-)
+# MCP SDK 2.x: FastMCP was renamed to MCPServer and transport settings
+# moved from the constructor to streamable_http_app().
+mcp = MCPServer("X Browser MCP")
 
 
 @mcp.tool()
-def x_post(text: str, image_base64: str | None = None, image_filename: str = "image.png") -> dict[str, Any]:
+def x_post(
+    text: str,
+    image_base64: str | None = None,
+    image_filename: str = "image.png",
+) -> dict[str, Any]:
     """Publish one post to X using the verified browser session.
 
     text is the post text. image_base64 is optional raw base64 or a data URL.
@@ -51,5 +52,11 @@ def x_status() -> dict[str, Any]:
     return browser_status()
 
 
-# server.py mounts this ASGI application at /mcp, so the MCP endpoint is exactly /mcp.
-mcp_app = mcp.streamable_http_app(streamable_http_path="/")
+# The FastAPI host mounts this ASGI application at /mcp, so the public
+# Streamable HTTP endpoint is exactly /mcp.
+mcp_app = mcp.streamable_http_app(
+    streamable_http_path="/",
+    stateless_http=True,
+    json_response=True,
+    transport_security=security,
+)
