@@ -24,6 +24,35 @@ def find_chrome():
     raise FileNotFoundError("Cannot find Google Chrome. Please install Google Chrome first.")
 
 
+def is_logged_in(page):
+    """Detect an authenticated X session without relying on the current URL.
+
+    X can keep the user on /i/jf/onboarding/web?mode=login even after a
+    successful Google login. The reliable signal is the authenticated X UI
+    and/or auth cookies, not simply whether the URL contains /home.
+    """
+    try:
+        if page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').count() > 0:
+            return True
+        if page.locator('[data-testid="AppTabBar_Home_Link"]').count() > 0:
+            return True
+        if page.locator('a[href="/home"]').count() > 0:
+            return True
+    except Exception:
+        pass
+
+    try:
+        cookies = page.context.cookies(["https://x.com"])
+        cookie_names = {c["name"] for c in cookies}
+        # auth_token is the main X web authentication cookie.
+        if "auth_token" in cookie_names:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 chrome = find_chrome()
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -58,10 +87,6 @@ with sync_playwright() as p:
     context = browser.contexts[0]
     page = context.pages[0] if context.pages else context.new_page()
 
-    # Only navigate to the login page when we are not already on X.
-    if "x.com" not in page.url:
-        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded")
-
     print("\n========================================")
     print("X login window is open.")
     print("Please log in manually.")
@@ -70,18 +95,31 @@ with sync_playwright() as p:
 
     input("After you are fully logged in and can see your X home page, press Enter here... ")
 
-    # Do NOT navigate to /home here.
-    # X may already be navigating to /home, and forcing another navigation
-    # can cause Playwright's 'Navigation is interrupted by another navigation' error.
-    time.sleep(5)
+    # Do NOT force navigation to /home here. X may legitimately remain on
+    # /i/jf/onboarding/web?mode=login after Google authentication.
+    time.sleep(2)
     print(f"Current URL: {page.url}")
 
-    if "/home" not in page.url and page.url.rstrip("/") != "https://x.com":
+    # Give X a few seconds to finish its SPA transitions / cookie writes.
+    logged_in = False
+    for _ in range(10):
+        if is_logged_in(page):
+            logged_in = True
+            break
+        time.sleep(1)
+
+    if not logged_in:
+        print("Could not positively detect the authenticated X UI/cookie.")
+        print("If you can see the X home timeline in the browser, press Enter again after it settles.")
+        input("Press Enter to retry detection... ")
+        logged_in = is_logged_in(page)
+
+    if not logged_in:
         raise RuntimeError(
-            f"X login was not completed. Current URL: {page.url}"
+            f"X login could not be verified. Current URL: {page.url}. "
+            "Make sure the browser is showing the authenticated X home page."
         )
 
-    # Save the authenticated browser session.
     context.storage_state(path=str(OUTPUT))
     print(f"\nSUCCESS: Saved browser session to: {OUTPUT.resolve()}")
     print("IMPORTANT: x_state.json contains authentication cookies. Do not commit or share it.")
