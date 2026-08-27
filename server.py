@@ -91,3 +91,9 @@ def create_post(post: Post):
 
 # Real MCP Streamable HTTP endpoint: https://<host>/mcp
 app.mount("/mcp", mcp_app)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
