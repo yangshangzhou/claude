@@ -6,6 +6,7 @@ from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 from browser_x_fix import post_x
+from browser_x_read import get_x_trends, search_x_posts
 
 PUBLIC_HOST = os.getenv("PUBLIC_HOST", "x-service-69x7.onrender.com")
 
@@ -50,6 +51,18 @@ def x_status() -> dict[str, Any]:
     """Return the current X browser session/task status."""
     from browser_x import browser_status
     return browser_status()
+
+
+@mcp.tool()
+def x_search_posts(query: str, max_results: int = 10, live: bool = True) -> dict[str, Any]:
+    """Search X posts through the existing browser session, without X API credits."""
+    return search_x_posts(query=query, max_results=max_results, live=live)
+
+
+@mcp.tool()
+def x_trends(max_results: int = 20) -> dict[str, Any]:
+    """Read visible X Explore/trend content through the existing browser session."""
+    return get_x_trends(max_results=max_results)
 
 
 # The FastAPI host mounts this ASGI application at /mcp, so the public
