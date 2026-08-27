@@ -7,6 +7,7 @@ X API. It is for local capability testing and does not require X API credits.
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -41,40 +42,94 @@ def _launch(p, state):
     return browser, context, state_file, page
 
 
-def _extract_posts(page, max_results: int) -> list[dict[str, Any]]:
-    """Extract visible post cards from the search timeline.
+def _search_diagnostics(page) -> dict[str, Any]:
+    """Capture enough live-page evidence to diagnose DOM changes."""
+    out: dict[str, Any] = {
+        "url": page.url if page else "",
+        "title": "",
+        "article_count": 0,
+        "tweet_testid_count": 0,
+        "status_link_count": 0,
+        "body_text": "",
+        "test_ids": [],
+    }
+    if not page:
+        return out
+    try:
+        out["title"] = page.title()
+    except Exception:
+        pass
+    try:
+        out["article_count"] = page.locator("article").count()
+    except Exception:
+        pass
+    try:
+        out["tweet_testid_count"] = page.locator('[data-testid="tweet"]').count()
+    except Exception:
+        pass
+    try:
+        out["status_link_count"] = page.locator('a[href*="/status/"]').count()
+    except Exception:
+        pass
+    try:
+        out["body_text"] = _visible_text(page)[:5000]
+    except Exception:
+        pass
+    try:
+        out["test_ids"] = page.locator('[data-testid]').evaluate_all(
+            "els => Array.from(new Set(els.map(e => e.getAttribute('data-testid')).filter(Boolean))).slice(0, 100)"
+        )
+    except Exception:
+        pass
+    return out
 
-    X changes DOM details frequently, so this intentionally relies on the
-    stable article/role structure and returns evidence fields rather than
-    pretending to expose API-complete post objects.
-    """
-    items = []
-    articles = page.locator('article')
-    count = min(articles.count(), max_results * 3)
-    seen = set()
-    for i in range(count):
+
+def _extract_posts(page, max_results: int) -> list[dict[str, Any]]:
+    """Extract visible posts using several DOM strategies used by X."""
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    # X normally renders posts as <article>. Some UI variants expose the same
+    # cards through [data-testid="tweet"], so use both and deduplicate by URL.
+    selectors = ['article', '[data-testid="tweet"]']
+    for selector in selectors:
+        cards = page.locator(selector)
         try:
-            article = articles.nth(i)
-            if not article.is_visible(timeout=500):
-                continue
-            text = (article.inner_text(timeout=1000) or "").strip()
-            if not text:
-                continue
-            links = article.locator('a[href*="/status/"]')
-            href = ""
-            if links.count():
-                href = links.first.get_attribute("href") or ""
-            if not href:
-                continue
-            url = "https://x.com" + href if href.startswith("/") else href
-            if url in seen:
-                continue
-            seen.add(url)
-            items.append({"url": url, "text": text[:3000]})
-            if len(items) >= max_results:
-                break
+            count = cards.count()
         except Exception:
             continue
+        for i in range(min(count, max_results * 5)):
+            try:
+                card = cards.nth(i)
+                if not card.is_visible(timeout=500):
+                    continue
+                text = (card.inner_text(timeout=1500) or "").strip()
+                if not text:
+                    continue
+                links = card.locator('a[href*="/status/"]')
+                href = ""
+                if links.count():
+                    href = links.first.get_attribute("href") or ""
+                if not href:
+                    # A status link may be nested in a child element. Search
+                    # the card HTML as a fallback without assuming a fixed DOM.
+                    try:
+                        matches = re.findall(r'href=["\']([^"\']*/status/[^"\']+)["\']', card.inner_html())
+                        if matches:
+                            href = matches[0]
+                    except Exception:
+                        pass
+                if not href:
+                    continue
+                url = "https://x.com" + href if href.startswith("/") else href
+                if url in seen:
+                    continue
+                seen.add(url)
+                items.append({"url": url, "text": text[:3000]})
+                if len(items) >= max_results:
+                    return items
+            except Exception:
+                continue
     return items
 
 
@@ -94,26 +149,48 @@ def search_x_posts(query: str, max_results: int = 10, live: bool = True) -> dict
         with sync_playwright() as p:
             browser, context, state_file, page = _launch(p, state)
             bx._set_task(busy=True, stage="opening_search", started_at=started, text=query, last_result=None)
-            from urllib.parse import quote
             mode = "live" if live else "top"
             url = f"https://x.com/search?q={quote(query)}&src=typed_query&f={mode}"
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
             bx._wait_for_app(page, started, 12000)
             if _login_required(page):
                 return {"success": False, "stage": "login_required", "message": "X browser session has expired.", "url": page.url}
-            page.wait_for_timeout(2500)
-            posts = _extract_posts(page, max_results)
+
+            bx._set_task(stage="waiting_search_results")
+            # Give X's client-side timeline time to hydrate, then scroll once
+            # if no cards are present. This avoids declaring an empty result
+            # while the virtualized timeline is still mounting.
+            deadline = time.time() + 8
+            posts: list[dict[str, Any]] = []
+            while time.time() < deadline:
+                bx._check_deadline(started)
+                posts = _extract_posts(page, max_results)
+                if posts:
+                    break
+                page.wait_for_timeout(800)
+            if not posts:
+                try:
+                    page.mouse.wheel(0, 900)
+                    page.wait_for_timeout(1500)
+                    posts = _extract_posts(page, max_results)
+                except Exception:
+                    pass
+
+            diagnostics = _search_diagnostics(page)
             result = {
-                "success": True,
-                "stage": "search_complete",
+                "success": bool(posts),
+                "stage": "search_complete" if posts else "search_no_posts_extracted",
                 "query": query,
                 "mode": mode,
                 "count": len(posts),
                 "posts": posts,
                 "source": "X web UI via Playwright",
                 "url": page.url,
+                "diagnostics": diagnostics,
             }
-            bx._set_task(stage="search_complete", last_result=result)
+            if not posts:
+                result["message"] = "X search page loaded, but no post cards could be extracted. See diagnostics for the current DOM/page text."
+            bx._set_task(stage=result["stage"], last_result=result)
             return result
     except Exception as exc:
         result = {"success": False, "stage": "timeout" if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)) else "exception", "message": f"X browser search failed: {type(exc).__name__}: {exc}", "url": page.url if page else ""}
@@ -148,8 +225,6 @@ def get_x_trends(max_results: int = 20) -> dict[str, Any]:
             text = _visible_text(page)
             lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
             lines = [x for x in lines if x]
-            # Keep candidate trend labels conservatively. We return raw visible
-            # lines as evidence rather than assigning an invented popularity score.
             candidates = []
             for line in lines:
                 if 2 <= len(line) <= 120 and line not in candidates:
