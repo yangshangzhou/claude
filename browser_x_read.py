@@ -43,7 +43,6 @@ def _launch(p, state):
 
 
 def _search_diagnostics(page) -> dict[str, Any]:
-    """Capture enough live-page evidence to diagnose DOM changes."""
     out: dict[str, Any] = {
         "url": page.url if page else "",
         "title": "",
@@ -88,9 +87,6 @@ def _extract_posts(page, max_results: int) -> list[dict[str, Any]]:
     """Extract visible posts using several DOM strategies used by X."""
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
-
-    # X normally renders posts as <article>. Some UI variants expose the same
-    # cards through [data-testid="tweet"], so use both and deduplicate by URL.
     selectors = ['article', '[data-testid="tweet"]']
     for selector in selectors:
         cards = page.locator(selector)
@@ -111,8 +107,6 @@ def _extract_posts(page, max_results: int) -> list[dict[str, Any]]:
                 if links.count():
                     href = links.first.get_attribute("href") or ""
                 if not href:
-                    # A status link may be nested in a child element. Search
-                    # the card HTML as a fallback without assuming a fixed DOM.
                     try:
                         matches = re.findall(r'href=["\']([^"\']*/status/[^"\']+)["\']', card.inner_html())
                         if matches:
@@ -155,11 +149,7 @@ def search_x_posts(query: str, max_results: int = 10, live: bool = True) -> dict
             bx._wait_for_app(page, started, 12000)
             if _login_required(page):
                 return {"success": False, "stage": "login_required", "message": "X browser session has expired.", "url": page.url}
-
             bx._set_task(stage="waiting_search_results")
-            # Give X's client-side timeline time to hydrate, then scroll once
-            # if no cards are present. This avoids declaring an empty result
-            # while the virtualized timeline is still mounting.
             deadline = time.time() + 8
             posts: list[dict[str, Any]] = []
             while time.time() < deadline:
@@ -175,7 +165,6 @@ def search_x_posts(query: str, max_results: int = 10, live: bool = True) -> dict
                     posts = _extract_posts(page, max_results)
                 except Exception:
                     pass
-
             diagnostics = _search_diagnostics(page)
             result = {
                 "success": bool(posts),
@@ -200,12 +189,21 @@ def search_x_posts(query: str, max_results: int = 10, live: bool = True) -> dict
         bx._cleanup_task(started, browser, context, state_file)
 
 
-def get_x_trends(max_results: int = 20) -> dict[str, Any]:
-    """Read visible X Explore trends through the logged-in browser session.
+def _read_explore_content(page, max_results: int) -> list[str]:
+    text = _visible_text(page)
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
+    lines = [x for x in lines if x]
+    candidates = []
+    for line in lines:
+        if 2 <= len(line) <= 120 and line not in candidates:
+            candidates.append(line)
+        if len(candidates) >= max_results:
+            break
+    return candidates
 
-    This is browser/UI evidence only. It does not claim that the returned list
-    is the complete platform-wide trend ranking.
-    """
+
+def get_x_trends(max_results: int = 20) -> dict[str, Any]:
+    """Read browser-visible X Explore content, with a browser-navigation fallback."""
     max_results = max(1, min(int(max_results), 50))
     state, error = _require_session()
     if error:
@@ -213,37 +211,53 @@ def get_x_trends(max_results: int = 20) -> dict[str, Any]:
 
     started = time.time()
     browser = context = state_file = page = None
+    navigation_error = None
     try:
         with sync_playwright() as p:
             browser, context, state_file, page = _launch(p, state)
             bx._set_task(busy=True, stage="opening_explore", started_at=started, text="", last_result=None)
-            page.goto("https://x.com/explore", wait_until="domcontentloaded", timeout=20000)
-            bx._wait_for_app(page, started, 12000)
+
+            try:
+                page.goto("https://x.com/explore", wait_until="domcontentloaded", timeout=20000)
+                bx._wait_for_app(page, started, 12000)
+            except Exception as exc:
+                navigation_error = f"{type(exc).__name__}: {exc}"
+                # Direct /explore can intermittently fail at the transport layer.
+                # Retry through /home, which is already proven to work, then
+                # click X's own Explore navigation item.
+                page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=20000)
+                bx._wait_for_app(page, started, 12000)
+                if _login_required(page):
+                    return {"success": False, "stage": "login_required", "message": "X browser session has expired.", "url": page.url}
+                explore = page.locator('a[data-testid="AppTabBar_Explore_Link"]')
+                if explore.count() and explore.first.is_visible(timeout=2000):
+                    explore.first.click(timeout=5000)
+                    page.wait_for_timeout(3000)
+                else:
+                    raise RuntimeError("X Explore navigation link was not available after /home fallback")
+
             if _login_required(page):
                 return {"success": False, "stage": "login_required", "message": "X browser session has expired.", "url": page.url}
-            page.wait_for_timeout(2500)
-            text = _visible_text(page)
-            lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
-            lines = [x for x in lines if x]
-            candidates = []
-            for line in lines:
-                if 2 <= len(line) <= 120 and line not in candidates:
-                    candidates.append(line)
-                if len(candidates) >= max_results:
-                    break
+
+            page.wait_for_timeout(2000)
+            candidates = _read_explore_content(page, max_results)
             result = {
-                "success": True,
-                "stage": "trends_page_read",
+                "success": bool(candidates),
+                "stage": "trends_page_read" if candidates else "trends_no_content",
                 "count": len(candidates),
                 "visible_lines": candidates,
                 "source": "X web UI via Playwright",
                 "url": page.url,
+                "navigation_fallback": bool(navigation_error),
+                "navigation_error": navigation_error,
                 "warning": "Browser-visible Explore content is evidence from the current session, not a guaranteed complete platform-wide trends API response.",
             }
-            bx._set_task(stage="trends_page_read", last_result=result)
+            if not candidates:
+                result["message"] = "X Explore opened, but no visible trend/content lines were extracted."
+            bx._set_task(stage=result["stage"], last_result=result)
             return result
     except Exception as exc:
-        result = {"success": False, "stage": "timeout" if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)) else "exception", "message": f"X browser trends read failed: {type(exc).__name__}: {exc}", "url": page.url if page else ""}
+        result = {"success": False, "stage": "timeout" if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)) else "exception", "message": f"X browser trends read failed: {type(exc).__name__}: {exc}", "url": page.url if page else "", "navigation_error": navigation_error}
         bx._set_task(stage="failed", last_result=result)
         return result
     finally:
