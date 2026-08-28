@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import logging
+import time
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -6,6 +8,9 @@ from pydantic import BaseModel
 from browser_x import browser_status, test_x_browser, test_x_compose
 from browser_x_fix import post_x, test_x_typing
 from mcp_server import mcp, mcp_app
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("x_mcp")
 
 
 @asynccontextmanager
@@ -28,7 +33,6 @@ def health():
     return {"status": "X Browser MCP running", "mcp": "/mcp"}
 
 
-# Existing diagnostic REST endpoints are kept under /api so /mcp can be a real MCP endpoint.
 @app.get("/api/status")
 def status():
     return browser_status()
@@ -76,12 +80,23 @@ def test_typing(text: str = "LOCAL_X_TYPING_TEST"):
 
 @app.post("/api/create_post")
 def create_post(post: Post):
+    start = time.time()
     text = post.text.strip()
+    logger.info("CREATE_POST start text=%s", text[:80])
+
     if not text:
         raise HTTPException(status_code=422, detail="text cannot be empty")
     if len(text) > 280:
         raise HTTPException(status_code=422, detail="X post is limited to 280 characters")
-    result = post_x(text, image_base64=post.image_base64, image_filename=post.image_filename)
+
+    try:
+        logger.info("Calling post_x")
+        result = post_x(text, image_base64=post.image_base64, image_filename=post.image_filename)
+        logger.info("CREATE_POST finish success=%s stage=%s elapsed=%.2fs", result.get("success"), result.get("stage"), time.time()-start)
+    except Exception:
+        logger.exception("CREATE_POST exception elapsed=%.2fs", time.time()-start)
+        raise
+
     if result.get("success"):
         return result
     if result.get("busy"):
@@ -89,7 +104,6 @@ def create_post(post: Post):
     raise HTTPException(status_code=503, detail=result)
 
 
-# Real MCP Streamable HTTP endpoint: https://<host>/mcp
 app.mount("/mcp", mcp_app)
 
 
