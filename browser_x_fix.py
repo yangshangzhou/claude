@@ -1,7 +1,7 @@
 """X posting flow.
 
-Keep this module deliberately close to the proven local_post_test.py flow:
-click editor -> keyboard.type -> verify text -> wait for enabled Post -> click -> verify.
+Uses the proven local keyboard.type() flow, then re-locates the editor after
+React updates so verification does not rely on a stale DOM locator.
 """
 
 import base64
@@ -28,6 +28,10 @@ def _focus_editor(page, editor) -> bool:
     try:
         editor.scroll_into_view_if_needed(timeout=3000)
         editor.click(timeout=3000)
+        try:
+            editor.focus(timeout=1500)
+        except Exception:
+            pass
         page.wait_for_timeout(300)
         return bool(page.evaluate("""() => {
             const e=document.activeElement;
@@ -37,19 +41,31 @@ def _focus_editor(page, editor) -> bool:
         return False
 
 
+def _current_editor_text(page) -> tuple[Any, str]:
+    """Re-find the editor after typing because X/React may replace its DOM node."""
+    current = _find_editor(page)
+    if not current:
+        return None, ""
+    return current, _editor_text(current)
+
+
 def _type_into_editor(page, editor, text: str) -> bool:
     if not _focus_editor(page, editor):
         return False
     try:
         page.keyboard.press("Control+A")
         page.keyboard.press("Backspace")
-        page.wait_for_timeout(300)
-        # This is intentionally the same mechanism used by the known local test.
-        page.keyboard.type(text, delay=80)
+        page.wait_for_timeout(500)
+        # Same real keyboard input mechanism as the proven local test.
+        page.keyboard.type(text, delay=120)
         page.wait_for_timeout(1000)
     except Exception:
         return False
-    return text.strip() in _editor_text(editor)
+
+    # IMPORTANT: re-locate after keyboard input. X can replace the React
+    # contenteditable during the input event, making the original locator stale.
+    current, actual = _current_editor_text(page)
+    return bool(current and text.strip() in actual)
 
 
 def _button_state(button) -> dict[str, Any] | None:
@@ -68,7 +84,7 @@ def _button_state(button) -> dict[str, Any] | None:
 
 
 def _find_post_button_any_state(page):
-    """Find Post even when it is disabled, so diagnostics show the real state."""
+    """Find Post even when disabled, so diagnostics show the real state."""
     try:
         loc = page.locator('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]')
         for i in range(min(loc.count(), 10)):
@@ -133,10 +149,12 @@ def _upload_image(page, image_base64: str, filename: str) -> dict[str, Any]:
 
 
 def _post_verified(page, editor, text: str, started: float, upload: dict[str, Any] | None) -> dict[str, Any]:
-    before = _editor_text(editor)
-    if text.strip() not in before:
-        return {"success": False, "stage": "final_text_verification_failed", "message": "Text is not present immediately before Post; nothing clicked.", "editor_text": before, "upload": upload}
+    # Re-find one final time immediately before validation/click.
+    current_editor, before = _current_editor_text(page)
+    if not current_editor or text.strip() not in before:
+        return {"success": False, "stage": "final_text_verification_failed", "message": "Text is not present in the current X editor immediately before Post; nothing clicked.", "editor_text": before, "upload": upload, "diagnostics": bx._diagnostics(page)}
 
+    editor = current_editor
     bx._set_task(stage="waiting_post_button")
     button = None
     state = None
@@ -152,9 +170,16 @@ def _post_verified(page, editor, text: str, started: float, upload: dict[str, An
     if not button or not state or state.get("disabled") or state.get("aria_disabled") == "true":
         return {"success": False, "stage": "post_button_disabled", "message": "Post button was found but remained disabled; nothing clicked.", "post_button": state, "editor_text": _editor_text(editor), "upload": upload, "diagnostics": bx._diagnostics(page)}
 
-    final_text = _editor_text(editor)
-    if text.strip() not in final_text:
-        return {"success": False, "stage": "final_text_verification_failed", "message": "Editor text changed before click; nothing clicked.", "editor_text": final_text, "post_button": state, "upload": upload}
+    # Re-find editor once more because waiting for React state may replace it.
+    current_editor, final_text = _current_editor_text(page)
+    if not current_editor or text.strip() not in final_text:
+        return {"success": False, "stage": "final_text_verification_failed", "message": "Editor text changed before click; nothing clicked.", "editor_text": final_text, "post_button": state, "upload": upload, "diagnostics": bx._diagnostics(page)}
+
+    # Re-find Post too, so we click the currently rendered button.
+    button = _find_post_button_any_state(page)
+    state = _button_state(button)
+    if not button or not state or state.get("disabled") or state.get("aria_disabled") == "true":
+        return {"success": False, "stage": "post_button_disabled", "message": "Post button became disabled before click; nothing clicked.", "post_button": state, "editor_text": final_text, "upload": upload, "diagnostics": bx._diagnostics(page)}
 
     bx._set_task(stage="clicking_post")
     button.scroll_into_view_if_needed(timeout=3000)
@@ -162,13 +187,9 @@ def _post_verified(page, editor, text: str, started: float, upload: dict[str, An
     bx._set_task(stage="verifying_post")
 
     deadline = time.time() + 10
-    last_text = ""
     while time.time() < deadline:
         bx._check_deadline(started)
-        try:
-            last_text = _editor_text(editor)
-        except Exception:
-            last_text = ""
+        _, last_text = _current_editor_text(page)
         if not last_text:
             return {"success": True, "stage": "post_complete", "message": "X Post click completed and composer was cleared.", "post_button": state, "upload": upload, "diagnostics": bx._diagnostics(page)}
         page.wait_for_timeout(500)
@@ -197,7 +218,8 @@ def test_x_typing(text: str = "LOCAL_X_TYPING_TEST") -> dict[str, Any]:
                 return {"success": False, "stage": "editor_not_found", "message": "Visible X editor was not found.", "diagnostics": bx._diagnostics(page)}
             focused = _focus_editor(page, editor)
             typed = _type_into_editor(page, editor, text) if focused else False
-            result = {"success": typed, "stage": "typing_test_complete" if typed else "typing_failed", "message": "Editor -> keyboard.type -> verification complete. Post was NOT clicked.", "focused": focused, "editor_text": _editor_text(editor), "post_button": _button_state(_find_post_button_any_state(page)), "diagnostics": bx._diagnostics(page)}
+            current_editor, actual = _current_editor_text(page)
+            result = {"success": typed, "stage": "typing_test_complete" if typed else "typing_failed", "message": "Editor -> keyboard.type -> re-find editor -> verification complete. Post was NOT clicked.", "focused": focused, "editor_found_after_type": current_editor is not None, "editor_text": actual, "post_button": _button_state(_find_post_button_any_state(page)), "diagnostics": bx._diagnostics(page)}
             bx._set_task(stage=result["stage"], last_result=result)
             return result
     except Exception as exc:
@@ -245,7 +267,8 @@ def post_x(text: str, image_base64: str | None = None, image_filename: str = "im
 
             bx._set_task(stage="typing")
             if not _type_into_editor(page, editor, text):
-                return {"success": False, "stage": "typing_failed", "message": "Text was not verified inside the editor; nothing clicked.", "editor_text": _editor_text(editor), "upload": upload, "diagnostics": bx._diagnostics(page)}
+                _, actual = _current_editor_text(page)
+                return {"success": False, "stage": "typing_failed", "message": "Text was not verified inside the current editor after keyboard.type(); nothing clicked.", "editor_text": actual, "upload": upload, "diagnostics": bx._diagnostics(page)}
 
             bx._set_task(stage="typing_verified")
             result = _post_verified(page, editor, text, started, upload)
