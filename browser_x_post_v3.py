@@ -76,10 +76,13 @@ def _keyboard_input(page,text):
 
 
 def _click_enabled_post(page, started, timeout_seconds=8):
+    print("[DEBUG] ENTER _click_enabled_post")
     deadline=min(time.time()+timeout_seconds, started+bx.TASK_HARD_TIMEOUT-2)
     checks=0; last=None
     while time.time()<deadline:
-        bx._check_deadline(started); checks+=1; last=_post_state(page)
+        checks+=1
+        print(f"[DEBUG] POST CHECK #{checks}")
+        bx._check_deadline(started); last=_post_state(page)
         if last.get('found') and last.get('disabled') is False:
             selector=f'[data-testid="{last.get("data_testid")}"]'
             button=page.locator(selector).first
@@ -116,7 +119,6 @@ def post_x(text: str, image_base64=None, image_filename="image.png") -> dict[str
                 result={"success":False,"stage":"step2_input_verification_failed","message":"2、键盘输入后 editor 内容未验证成功；未点击 POST。","step1_editor":editor_before,"step1_post_button":post_before,"step2_keyboard_input":{"input_text":text,"operation":operation,"editor_after":editor_after,"text_verified":verified,"post_button_after":post_after},"diagnostics":bx._diagnostics(page)}
                 bx._set_task(stage=result['stage'],last_result=result); return result
 
-            # Only click after the editor contains the requested text AND X reports POST enabled.
             bx._set_task(stage='step3_post_clicking'); click_result=_click_enabled_post(page,started)
             final_post_state=_post_state(page)
             if not click_result.get('clicked'):
