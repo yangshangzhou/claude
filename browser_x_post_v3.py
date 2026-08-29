@@ -1,4 +1,10 @@
-"""X post execution path v3: explicit three-step editor diagnosis."""
+"""X post v3: focused editor input experiment.
+
+The test intentionally separates two hypotheses:
+1) direct DOM text assignment + input events
+2) real keyboard input
+Each method starts from a clean editor and reports every observation.
+"""
 import time
 from typing import Any
 
@@ -6,311 +12,236 @@ import browser_x as bx
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
-def find_editor(page):
-    return bx._find_visible_editor(page)
-
-
-def editor_text(editor):
-    return bx._editor_text(editor)
-
-
-def focus_editor(page, editor):
+def _find_editor_dom(page):
+    """Read the editor directly from the page DOM, avoiding locator visibility races."""
     try:
-        editor.scroll_into_view_if_needed(timeout=1500)
-        editor.click(timeout=3000)
-        page.wait_for_timeout(300)
-        return True
+        info = page.evaluate("""
+        () => {
+          const el = document.querySelector('[data-testid="tweetTextarea_0"]')
+                || document.querySelector('[contenteditable="true"][role="textbox"]');
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return {
+            testid: el.getAttribute('data-testid'),
+            role: el.getAttribute('role'),
+            contenteditable: el.getAttribute('contenteditable'),
+            text: (el.innerText || el.textContent || '').trim(),
+            html: el.innerHTML,
+            rect: {x:r.x,y:r.y,w:r.width,h:r.height},
+            focused: document.activeElement === el
+          };
+        }
+        """, timeout=1500)
+        return info
     except Exception:
-        try:
-            editor.evaluate("el => el.focus()", timeout=1000)
-            page.wait_for_timeout(300)
-            return True
-        except Exception:
-            return False
+        return None
 
 
-def post_button(page):
+def _editor_locator(page):
+    """Return the stable tweetTextarea_0 locator only after DOM confirms it exists."""
+    info = _find_editor_dom(page)
+    if not info:
+        return None
+    selector = '[data-testid="tweetTextarea_0"]' if info.get("testid") == "tweetTextarea_0" else '[contenteditable="true"][role="textbox"]'
+    try:
+        loc = page.locator(selector).first
+        loc.wait_for(state="attached", timeout=1500)
+        return loc
+    except Exception:
+        return None
+
+
+def _read_editor(page):
+    info = _find_editor_dom(page)
+    if not info:
+        return {"found": False, "text": "", "html": "", "focused": False}
+    return {"found": True, "testid": info.get("testid"), "role": info.get("role"), "contenteditable": info.get("contenteditable"), "text": info.get("text", ""), "html": info.get("html", ""), "focused": info.get("focused", False), "rect": info.get("rect")}
+
+
+def _post_button(page):
     for selector in ['[data-testid="tweetButtonInline"]', '[data-testid="tweetButton"]']:
         try:
             loc = page.locator(selector)
-            for i in range(min(loc.count(), 10)):
+            count = min(loc.count(), 10)
+            for i in range(count):
                 b = loc.nth(i)
-                if bx._element_visible(b):
-                    return b
+                try:
+                    if b.is_visible(timeout=700):
+                        return b
+                except Exception:
+                    continue
         except Exception:
-            pass
+            continue
     return None
 
 
-def button_state(button):
-    if not button:
+def _post_state(page):
+    b = _post_button(page)
+    if not b:
         return {"found": False, "data_testid": None, "disabled": None, "aria_disabled": None}
     try:
         return {
             "found": True,
-            "data_testid": button.get_attribute("data-testid"),
-            "disabled": button.is_disabled(timeout=800),
-            "aria_disabled": button.get_attribute("aria-disabled"),
+            "data_testid": b.get_attribute("data-testid", timeout=1000),
+            "disabled": b.is_disabled(timeout=1000),
+            "aria_disabled": b.get_attribute("aria-disabled", timeout=1000),
         }
     except Exception as exc:
-        return {"found": True, "data_testid": None, "disabled": None, "aria_disabled": None, "error": repr(exc)}
+        return {"found": True, "data_testid": None, "disabled": None, "aria_disabled": None, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _dom_text(editor):
-    if not editor:
-        return ""
+def _clear_editor(page):
+    # Use DOM selection only to prepare a clean independent experiment.
     try:
-        return (editor.evaluate("el => (el.innerText || el.textContent || '').trim()", timeout=1000) or "").strip()
-    except Exception:
-        return ""
-
-
-def _clear_editor(page, editor):
-    try:
-        editor.click(timeout=2000)
-        page.keyboard.press("Control+A")
-        page.keyboard.press("Backspace")
-        page.wait_for_timeout(300)
+        page.evaluate("""
+        () => {
+          const el = document.querySelector('[data-testid="tweetTextarea_0"]') || document.querySelector('[contenteditable="true"][role="textbox"]');
+          if (!el) return false;
+          el.focus();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          const sel = window.getSelection();
+          sel.removeAllRanges(); sel.addRange(range);
+          document.execCommand('delete');
+          return true;
+        }
+        """, timeout=1500)
     except Exception:
         pass
+    page.wait_for_timeout(300)
 
 
-def _direct_dom_assignment(editor, text):
-    """Last-resort diagnostic: mutate the contenteditable and emit input events."""
-    return editor.evaluate("""
-    (el, value) => {
+def _direct_assignment(page, text):
+    """Experiment A: assign text directly, then emit input/change events."""
+    return page.evaluate("""
+    (value) => {
+      const el = document.querySelector('[data-testid="tweetTextarea_0"]') || document.querySelector('[contenteditable="true"][role="textbox"]');
+      if (!el) return {found:false, before:'', after:'', input_event:false};
+      const before = (el.innerText || el.textContent || '').trim();
       el.focus();
       el.textContent = value;
-      el.dispatchEvent(new InputEvent('beforeinput', {
-        bubbles: true, cancelable: true, inputType: 'insertText', data: value
-      }));
-      el.dispatchEvent(new InputEvent('input', {
-        bubbles: true, inputType: 'insertText', data: value
-      }));
-      el.dispatchEvent(new Event('change', {bubbles: true}));
-      return (el.innerText || el.textContent || '').trim();
+      const beforeInput = new InputEvent('beforeinput', {bubbles:true,cancelable:true,inputType:'insertText',data:value});
+      const input = new InputEvent('input', {bubbles:true,inputType:'insertText',data:value});
+      const change = new Event('change', {bubbles:true});
+      const beforeInputResult = el.dispatchEvent(beforeInput);
+      const inputResult = el.dispatchEvent(input);
+      el.dispatchEvent(change);
+      return {
+        found:true,
+        before,
+        after:(el.innerText || el.textContent || '').trim(),
+        html:el.innerHTML,
+        beforeInputResult,
+        inputResult,
+        focused:document.activeElement===el
+      };
     }
-    """, text, timeout=1500)
+    """, text, timeout=2000)
 
 
-def type_and_verify(page, editor, text):
-    """Step 2 input test. Return the method that actually changed the editor."""
-    if not focus_editor(page, editor):
-        return False, {"input_method": "none", "editor_text": "", "focused": False}
-
-    _clear_editor(page, editor)
-
-    # First requested experiment: real keyboard input.
-    keyboard_error = None
+def _keyboard_input(page, text):
+    """Experiment B: real keyboard input into the contenteditable."""
+    loc = _editor_locator(page)
+    if not loc:
+        return {"success":False,"error":"Editor locator could not be attached after DOM confirmation."}
     try:
-        page.keyboard.type(text, delay=100)
+        loc.click(timeout=2500)
+        page.wait_for_timeout(200)
+        page.keyboard.type(text, delay=120)
         page.wait_for_timeout(800)
+        return {"success":True}
     except Exception as exc:
-        keyboard_error = f"{type(exc).__name__}: {exc}"
+        return {"success":False,"error":f"{type(exc).__name__}: {exc}"}
 
-    current = find_editor(page) or editor
-    actual = _dom_text(current)
-    if text.strip() in actual:
-        return True, {"input_method": "keyboard.type", "editor_text": actual, "focused": True, "keyboard_error": keyboard_error}
 
-    # If keyboard.type did not change the DOM, try insert_text.
-    insert_error = None
-    try:
-        current.click(timeout=2000)
-        page.keyboard.insert_text(text)
-        page.wait_for_timeout(800)
-    except Exception as exc:
-        insert_error = f"{type(exc).__name__}: {exc}"
-
-    current = find_editor(page) or editor
-    actual = _dom_text(current)
-    if text.strip() in actual:
-        return True, {"input_method": "keyboard.insert_text", "editor_text": actual, "focused": True, "keyboard_error": keyboard_error, "insert_error": insert_error}
-
-    # Explicit assignment is only used after both real input methods failed.
-    assignment_error = None
-    assigned = ""
-    try:
-        assigned = _direct_dom_assignment(current, text)
-        page.wait_for_timeout(800)
-    except Exception as exc:
-        assignment_error = f"{type(exc).__name__}: {exc}"
-
-    current = find_editor(page) or editor
-    actual = _dom_text(current)
-    return text.strip() in actual, {
-        "input_method": "dom_assignment_input_event",
-        "editor_text": actual,
-        "dom_assignment_result": assigned,
-        "focused": True,
-        "keyboard_error": keyboard_error,
-        "insert_error": insert_error,
-        "assignment_error": assignment_error,
-    }
+def _wait_editor(page, started, seconds=12):
+    deadline = min(time.time()+seconds, started+bx.TASK_HARD_TIMEOUT-3)
+    while time.time() < deadline:
+        bx._check_deadline(started)
+        info = _read_editor(page)
+        if info.get("found"):
+            return info
+        page.wait_for_timeout(300)
+    return None
 
 
 def post_x(text: str, image_base64=None, image_filename="image.png") -> dict[str, Any]:
     state = bx._storage_state()
     if not state:
-        return bx.browser_status()
+        return {"success":False,"stage":"configuration","message":"No X browser session configured."}
 
-    started, lock_error = bx._acquire_task("starting_browser_v3")
+    started, lock_error = bx._acquire_task("input_experiment_start")
     if lock_error:
         lock_error["text"] = text
         return lock_error
 
-    browser = context = state_file = page = None
+    browser=context=state_file=page=None
     try:
         with sync_playwright() as p:
             bx._set_task(stage="launching_browser")
-            browser, context, state_file, page = bx._launch_context(p, state)
-
+            browser,context,state_file,page=bx._launch_context(p,state)
             bx._set_task(stage="opening_compose")
-            page.goto(bx.COMPOSE_URL, wait_until="commit", timeout=12000)
+            page.goto(bx.COMPOSE_URL,wait_until="commit",timeout=12000)
 
-            # ============================================================
-            # STEP 1: Find editor ID and print Post button state.
-            # ============================================================
+            # STEP 1
             bx._set_task(stage="step1_find_editor")
-            deadline = min(time.time() + 15, started + bx.TASK_HARD_TIMEOUT - 2)
-            editor = None
-            while time.time() < deadline:
-                bx._check_deadline(started)
-                editor = find_editor(page)
-                if editor:
-                    break
-                page.wait_for_timeout(300)
+            editor_before=_wait_editor(page,started,12)
+            post_before=_post_state(page)
+            if not editor_before:
+                return {"success":False,"stage":"step1_editor_not_found","step":1,"message":"1、没有找到 editor。","editor":{"found":False},"post_button":post_before,"diagnostics":bx._diagnostics(page)}
 
-            step1_button = button_state(post_button(page))
-            if not editor:
-                result = {
-                    "success": False,
-                    "stage": "step1_editor_not_found",
-                    "step": 1,
-                    "message": "1、没有找到 editor。",
-                    "editor": {"found": False, "data_testid": None},
-                    "post_button": step1_button,
-                    "diagnostics": bx._diagnostics(page),
-                }
-                bx._set_task(stage=result["stage"], last_result=result)
-                return result
+            step1={"found":True,"data_testid":editor_before.get("testid"),"role":editor_before.get("role"),"contenteditable":editor_before.get("contenteditable"),"text":editor_before.get("text",""),"focused":editor_before.get("focused",False)}
 
-            editor_id = editor.get_attribute("data-testid")
-            step1 = {
-                "found": True,
-                "data_testid": editor_id,
-                "role": editor.get_attribute("role"),
-                "contenteditable": editor.get_attribute("contenteditable"),
+            # EXPERIMENT A: direct assignment
+            bx._set_task(stage="test1_direct_assignment")
+            _clear_editor(page)
+            a_before=_read_editor(page)
+            a_result=_direct_assignment(page,text)
+            page.wait_for_timeout(1000)
+            a_after=_read_editor(page)
+            a_post=_post_state(page)
+            a_ok=text.strip() in a_after.get("text","")
+
+            # EXPERIMENT B starts from a clean editor, independently.
+            bx._set_task(stage="test2_keyboard_input")
+            _clear_editor(page)
+            b_before=_read_editor(page)
+            b_result=_keyboard_input(page,text)
+            page.wait_for_timeout(500)
+            b_after=_read_editor(page)
+            b_post=_post_state(page)
+            b_ok=text.strip() in b_after.get("text","")
+
+            result={
+                "success":False,
+                "stage":"input_experiment_complete",
+                "message":"Editor 输入实验完成；未点击 POST。",
+                "step1_editor":step1,
+                "step1_post_button":post_before,
+                "test1_direct_assignment":{
+                    "method":"直接给 editor.textContent 赋值 + beforeinput/input/change",
+                    "before":a_before,
+                    "operation":a_result,
+                    "after":a_after,
+                    "text_verified":a_ok,
+                    "post_button":a_post,
+                },
+                "test2_keyboard_input":{
+                    "method":"模拟真实键盘输入 page.keyboard.type",
+                    "before":b_before,
+                    "operation":b_result,
+                    "after":b_after,
+                    "text_verified":b_ok,
+                    "post_button":b_post,
+                },
+                "diagnostics":bx._diagnostics(page),
             }
-            # Do not call Post here. This is only the editor discovery check.
-
-            # ============================================================
-            # STEP 2: Type text, then re-read editor content and Post state.
-            # ============================================================
-            bx._set_task(stage="step2_type_and_verify")
-            ok, input_info = type_and_verify(page, editor, text)
-            current = find_editor(page) or editor
-            reread_text = editor_text(current)
-            step2_button = button_state(post_button(page))
-
-            if not ok or text.strip() not in reread_text:
-                result = {
-                    "success": False,
-                    "stage": "step2_editor_input_failed",
-                    "step": 2,
-                    "message": "2、EDITOR 输入后重新读取失败，EDITOR 内容没有正常改变。",
-                    "editor": step1,
-                    "input_method": input_info.get("input_method"),
-                    "input_result": input_info,
-                    "editor_text_after_input": reread_text,
-                    "post_button": step2_button,
-                    "diagnostics": bx._diagnostics(page),
-                }
-                bx._set_task(stage=result["stage"], last_result=result)
-                return result
-
-            # ============================================================
-            # STEP 3: Content is verified. Print Post state again.
-            # If disabled here, editor is proven to contain the text and the
-            # remaining problem is NOT editor text insertion.
-            # ============================================================
-            bx._set_task(stage="step3_editor_verified")
-            step3_button = button_state(post_button(page))
-            if not step3_button.get("found"):
-                result = {
-                    "success": False,
-                    "stage": "step3_post_button_not_found",
-                    "step": 3,
-                    "message": "3、EDITOR 内容已正常获取；但没有找到 POST 按钮，因此不是 EDITOR 内容读取问题。",
-                    "editor": step1,
-                    "editor_text_verified": reread_text,
-                    "post_button": step3_button,
-                    "diagnostics": bx._diagnostics(page),
-                }
-                bx._set_task(stage=result["stage"], last_result=result)
-                return result
-
-            if step3_button.get("disabled") or step3_button.get("aria_disabled") == "true":
-                result = {
-                    "success": False,
-                    "stage": "step3_post_button_disabled",
-                    "step": 3,
-                    "message": "3、EDITOR 内容已正常获取，POST 按钮仍不可点击。问题不在 EDITOR。",
-                    "editor": step1,
-                    "editor_text_verified": reread_text,
-                    "post_button": step3_button,
-                    "diagnostics": bx._diagnostics(page),
-                }
-                bx._set_task(stage=result["stage"], last_result=result)
-                return result
-
-            # Only now is clicking Post allowed.
-            bx._set_task(stage="clicking_post")
-            button = post_button(page)
-            button.click(timeout=5000)
-
-            bx._set_task(stage="verifying_post")
-            deadline = min(time.time() + 10, started + bx.TASK_HARD_TIMEOUT - 2)
-            while time.time() < deadline:
-                bx._check_deadline(started)
-                if not editor_text(find_editor(page)):
-                    result = {
-                        "success": True,
-                        "stage": "post_complete",
-                        "step": 3,
-                        "message": "3、EDITOR 内容正常，POST 按钮可点击，已完成点击并确认编辑器清空。",
-                        "editor": step1,
-                        "editor_text_verified": reread_text,
-                        "post_button": step3_button,
-                        "input_method": input_info.get("input_method"),
-                        "diagnostics": bx._diagnostics(page),
-                    }
-                    bx._set_task(stage="post_complete", last_result=result)
-                    return result
-                page.wait_for_timeout(500)
-
-            result = {
-                "success": False,
-                "stage": "post_verification_failed",
-                "step": 3,
-                "message": "3、EDITOR 内容正常且 POST 已点击，但无法确认编辑器清空。",
-                "editor": step1,
-                "editor_text_verified": reread_text,
-                "post_button": step3_button,
-                "diagnostics": bx._diagnostics(page),
-            }
-            bx._set_task(stage=result["stage"], last_result=result)
+            bx._set_task(stage=result["stage"],last_result=result)
             return result
-
     except Exception as exc:
-        result = {
-            "success": False,
-            "stage": "timeout" if isinstance(exc, (TimeoutError, PlaywrightTimeoutError)) else "exception",
-            "message": f"X post v3 failed: {type(exc).__name__}: {exc}",
-            "diagnostics": bx._diagnostics(page) if page else {},
-        }
-        bx._set_task(stage="failed", last_result=result)
+        result={"success":False,"stage":"timeout" if isinstance(exc,(TimeoutError,PlaywrightTimeoutError)) else "exception","message":f"X input experiment failed: {type(exc).__name__}: {exc}","diagnostics":bx._diagnostics(page) if page else {}}
+        bx._set_task(stage="failed",last_result=result)
         return result
     finally:
         if started is not None:
-            bx._cleanup_task(started, browser, context, state_file)
+            bx._cleanup_task(started,browser,context,state_file)
