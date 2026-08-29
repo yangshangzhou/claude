@@ -66,15 +66,21 @@ def _element_visible(candidate) -> bool:
 
 
 def _find_visible_editor(page):
-    # X currently exposes the stable editor as data-testid=tweetTextarea_0.
-    # Resolve that node first. Do not require document.activeElement to be the
-    # same node: React may focus an internal contenteditable child.
-    selectors = [
-        '[data-testid="tweetTextarea_0"]',
+    # tweetTextarea_0 is the stable anchor in the current X compose DOM.
+    # Do not require a Playwright visibility probe here: the diagnostics have
+    # shown this node can be document.activeElement while React is rendering.
+    primary = page.locator('[data-testid="tweetTextarea_0"]').first
+    try:
+        primary.wait_for(state="attached", timeout=1200)
+        return primary
+    except Exception:
+        pass
+
+    # Fallbacks for markup changes.
+    for selector in [
         '[contenteditable="true"][role="textbox"]',
         '[contenteditable="true"]',
-    ]
-    for selector in selectors:
+    ]:
         try:
             loc = page.locator(selector)
             count = min(loc.count(), 10)
@@ -84,20 +90,6 @@ def _find_visible_editor(page):
                     return candidate
         except Exception:
             continue
-
-    # Last-resort recovery: diagnostics can see the exact tweetTextarea_0
-    # element even when Playwright's visibility probe temporarily fails.
-    try:
-        exists = page.evaluate("""() => {
-            const e=document.querySelector('[data-testid="tweetTextarea_0"]');
-            if (!e) return false;
-            const r=e.getBoundingClientRect(), s=getComputedStyle(e);
-            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
-        }""", timeout=1200)
-        if exists:
-            return page.locator('[data-testid="tweetTextarea_0"]').first
-    except Exception:
-        pass
     return None
 
 
@@ -120,12 +112,9 @@ def _focus_editor(page, editor) -> bool:
         page.wait_for_timeout(300)
         return True
     except Exception:
-        # X can move the actual contenteditable focus during React rendering.
         try:
-            page.evaluate("""() => {
-                const e=document.querySelector('[data-testid="tweetTextarea_0"]');
-                if (e) e.click();
-            }""")
+            editor.evaluate("el => el.click()", timeout=1000)
+            page.wait_for_timeout(300)
             return True
         except Exception:
             return False
@@ -191,6 +180,9 @@ def _diagnostics(page):
     except Exception: pass
     try:
         out["active_element"] = page.evaluate("""() => { const e=document.activeElement; return e ? {tag:e.tagName,testid:e.getAttribute('data-testid'),role:e.getAttribute('role'),editable:e.getAttribute('contenteditable')} : null; }""")
+    except Exception: pass
+    try:
+        out["tweet_textarea_dom"] = page.evaluate("""() => { const e=document.querySelector('[data-testid=\"tweetTextarea_0\"]'); return e ? {tag:e.tagName,text:(e.innerText||e.textContent||'').trim(),role:e.getAttribute('role'),editable:e.getAttribute('contenteditable'),rect:(()=>{const r=e.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height}})()} : null; }""")
     except Exception: pass
     return out
 
