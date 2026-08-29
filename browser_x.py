@@ -57,15 +57,18 @@ def browser_status():
 
 def _element_visible(candidate) -> bool:
     try:
-        return bool(candidate.evaluate("""el => { const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; }""", timeout=1000))
+        return bool(candidate.is_visible(timeout=1000))
     except Exception:
-        return False
+        try:
+            return bool(candidate.evaluate("""el => { const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; }""", timeout=1000))
+        except Exception:
+            return False
 
 
 def _find_visible_editor(page):
-    # Match the selector order from the known-good local_post_test.py.
-    # Do not prefer nested contenteditable children: X may expose the
-    # tweetTextarea_0 container as the stable editor handle.
+    # X currently exposes the stable editor as data-testid=tweetTextarea_0.
+    # Resolve that node first. Do not require document.activeElement to be the
+    # same node: React may focus an internal contenteditable child.
     selectors = [
         '[data-testid="tweetTextarea_0"]',
         '[contenteditable="true"][role="textbox"]',
@@ -81,6 +84,20 @@ def _find_visible_editor(page):
                     return candidate
         except Exception:
             continue
+
+    # Last-resort recovery: diagnostics can see the exact tweetTextarea_0
+    # element even when Playwright's visibility probe temporarily fails.
+    try:
+        exists = page.evaluate("""() => {
+            const e=document.querySelector('[data-testid="tweetTextarea_0"]');
+            if (!e) return false;
+            const r=e.getBoundingClientRect(), s=getComputedStyle(e);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+        }""", timeout=1200)
+        if exists:
+            return page.locator('[data-testid="tweetTextarea_0"]').first
+    except Exception:
+        pass
     return None
 
 
@@ -97,15 +114,21 @@ def _editor_text(editor) -> str:
 
 
 def _focus_editor(page, editor) -> bool:
-    # Important: do not require document.activeElement to equal the editor.
-    # X's React editor can move focus to an internal contenteditable node.
     try:
         editor.scroll_into_view_if_needed(timeout=1500)
         editor.click(timeout=3000)
         page.wait_for_timeout(300)
         return True
     except Exception:
-        return False
+        # X can move the actual contenteditable focus during React rendering.
+        try:
+            page.evaluate("""() => {
+                const e=document.querySelector('[data-testid="tweetTextarea_0"]');
+                if (e) e.click();
+            }""")
+            return True
+        except Exception:
+            return False
 
 
 def _type_into_editor(page, editor, text: str) -> bool:
@@ -119,7 +142,6 @@ def _type_into_editor(page, editor, text: str) -> bool:
         page.wait_for_timeout(1000)
     except Exception:
         return False
-    # React may replace the editor node after keyboard input. Always re-find it.
     current = _find_visible_editor(page)
     actual = _editor_text(current)
     return bool(current and text.strip() in actual)
