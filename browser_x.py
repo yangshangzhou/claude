@@ -57,27 +57,25 @@ def browser_status():
 
 def _element_visible(candidate) -> bool:
     try:
-        return bool(candidate.is_visible(timeout=1000))
+        return bool(candidate.evaluate("""el => { const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; }""", timeout=1000))
     except Exception:
         return False
 
 
 def _find_visible_editor(page):
-    # X currently exposes tweetTextarea_0. In some renders it is the actual
-    # contenteditable; in others the editable child is nested underneath it.
+    # Match the selector order from the known-good local_post_test.py.
+    # Do not prefer nested contenteditable children: X may expose the
+    # tweetTextarea_0 container as the stable editor handle.
     selectors = [
-        '[data-testid="tweetTextarea_0"] [contenteditable="true"]',
-        '[data-testid="tweetTextarea_0"] [role="textbox"]',
         '[data-testid="tweetTextarea_0"]',
         '[contenteditable="true"][role="textbox"]',
-        '[role="textbox"][contenteditable="true"]',
         '[contenteditable="true"]',
-        'textarea',
     ]
     for selector in selectors:
         try:
             loc = page.locator(selector)
-            for i in range(min(loc.count(), 10)):
+            count = min(loc.count(), 10)
+            for i in range(count):
                 candidate = loc.nth(i)
                 if _element_visible(candidate):
                     return candidate
@@ -87,24 +85,25 @@ def _find_visible_editor(page):
 
 
 def _editor_text(editor) -> str:
-    try:
-        return (editor.evaluate("el => (el.innerText || el.textContent || el.value || '').trim()", timeout=1000) or "").strip()
-    except Exception:
+    if editor is None:
         return ""
+    try:
+        return (editor.evaluate("el => (el.innerText || el.textContent || '').trim()", timeout=1000) or "").strip()
+    except Exception:
+        try:
+            return (editor.input_value(timeout=1000) or "").strip()
+        except Exception:
+            return ""
 
 
 def _focus_editor(page, editor) -> bool:
+    # Important: do not require document.activeElement to equal the editor.
+    # X's React editor can move focus to an internal contenteditable node.
     try:
         editor.scroll_into_view_if_needed(timeout=1500)
-        editor.click(timeout=1500)
-        try:
-            editor.focus(timeout=1500)
-        except Exception:
-            pass
-        return bool(page.evaluate("""() => {
-            const el=document.activeElement;
-            return !!el && (el.getAttribute('data-testid')==='tweetTextarea_0' || el.getAttribute('role')==='textbox' || el.getAttribute('contenteditable')==='true');
-        }"""))
+        editor.click(timeout=3000)
+        page.wait_for_timeout(300)
+        return True
     except Exception:
         return False
 
@@ -113,33 +112,33 @@ def _type_into_editor(page, editor, text: str) -> bool:
     if not _focus_editor(page, editor):
         return False
     try:
-        page.keyboard.type(text, delay=20)
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.wait_for_timeout(500)
+        page.keyboard.type(text, delay=120)
+        page.wait_for_timeout(1000)
     except Exception:
-        try:
-            editor.press_sequentially(text, delay=20, timeout=8000)
-        except Exception:
-            return False
-    page.wait_for_timeout(700)
-    return text.strip() in _editor_text(editor)
+        return False
+    # React may replace the editor node after keyboard input. Always re-find it.
+    current = _find_visible_editor(page)
+    actual = _editor_text(current)
+    return bool(current and text.strip() in actual)
 
 
 def _find_post_button(page):
-    try:
-        loc = page.locator('[data-testid="tweetButton"]')
-        for i in range(min(loc.count(), 10)):
-            c = loc.nth(i)
-            if _element_visible(c) and not c.is_disabled(timeout=800):
-                return c
-    except Exception:
-        pass
-    try:
-        loc = page.locator('[data-testid="tweetButtonInline"]')
-        for i in range(min(loc.count(), 10)):
-            c = loc.nth(i)
-            if _element_visible(c) and not c.is_disabled(timeout=800):
-                return c
-    except Exception:
-        pass
+    for selector in ['[data-testid="tweetButtonInline"]', '[data-testid="tweetButton"]']:
+        try:
+            loc = page.locator(selector)
+            for i in range(min(loc.count(), 10)):
+                c = loc.nth(i)
+                if _element_visible(c):
+                    try:
+                        if not c.is_disabled(timeout=800) and c.get_attribute("aria-disabled") != "true":
+                            return c
+                    except Exception:
+                        continue
+        except Exception:
+            pass
     return None
 
 
@@ -166,7 +165,10 @@ def _diagnostics(page):
     except Exception: pass
     try: out["body"] = page.locator("body").inner_text(timeout=1200)[:2000]
     except Exception: pass
-    try: out["test_ids"] = page.locator("[data-testid]").evaluate_all("els=>Array.from(new Set(els.map(e=>e.getAttribute('data-testid')).filter(Boolean))).slice(0,100)")
+    try: out["test_ids"] = page.locator("[data-testid]").evaluate_all("els=>Array.from(new Set(els.map(e=>e.getAttribute('data-testid')).filter(Boolean))).slice(0,100)", timeout=1500)
+    except Exception: pass
+    try:
+        out["active_element"] = page.evaluate("""() => { const e=document.activeElement; return e ? {tag:e.tagName,testid:e.getAttribute('data-testid'),role:e.getAttribute('role'),editable:e.getAttribute('contenteditable')} : null; }""")
     except Exception: pass
     return out
 
@@ -186,28 +188,28 @@ def _launch_context(p, state):
     sf.write(state); sf.close()
     ctx = browser.new_context(storage_state=sf.name, viewport={"width": 1280, "height": 900}, locale="en-US")
     page = ctx.new_page()
-    page.set_default_timeout(5000)
+    page.set_default_timeout(3000)
     _install_lightweight_network_policy(page)
     return browser, ctx, sf.name, page
 
 
-def _wait_for_app(page, started_at, timeout_ms=15000):
-    deadline = time.time() + timeout_ms / 1000
+def _wait_for_app(page, started_at, timeout_ms=10000):
+    deadline = min(time.time() + timeout_ms / 1000, started_at + TASK_HARD_TIMEOUT - 2)
     while time.time() < deadline:
         _check_deadline(started_at)
         try:
-            if page.evaluate("() => !!document.body && document.body.children.length > 0"):
+            if page.evaluate("() => !!document.body && document.body.children.length > 0", timeout=1000):
                 return True
         except Exception:
             pass
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(250)
     return False
 
 
 def _open_compose(page, started_at):
     _set_task(stage="opening_home")
-    page.goto(_HOME_URL, wait_until="domcontentloaded", timeout=20000)
-    _wait_for_app(page, started_at, 12000)
+    page.goto(_HOME_URL, wait_until="commit", timeout=12000)
+    _wait_for_app(page, started_at, 10000)
     if _login_state(page) or _onboarding_state(page):
         return page.url
     _set_task(stage="opening_compose")
@@ -215,17 +217,16 @@ def _open_compose(page, started_at):
     if entry:
         try:
             entry.click(timeout=2500)
-            page.wait_for_timeout(1200)
             return page.url
         except Exception:
             pass
-    page.goto(COMPOSE_URL, wait_until="domcontentloaded", timeout=20000)
-    _wait_for_app(page, started_at, 12000)
+    page.goto(COMPOSE_URL, wait_until="commit", timeout=12000)
+    _wait_for_app(page, started_at, 10000)
     return page.url
 
 
-def _wait_for_editor(page, started_at, timeout_ms=12000):
-    deadline = time.time() + timeout_ms / 1000
+def _wait_for_editor(page, started_at, timeout_ms=10000):
+    deadline = min(time.time() + timeout_ms / 1000, started_at + TASK_HARD_TIMEOUT - 2)
     while time.time() < deadline:
         _check_deadline(started_at)
         editor = _find_visible_editor(page)
@@ -273,8 +274,8 @@ def test_x_browser():
     try:
         with sync_playwright() as p:
             _set_task(stage="test_launching_browser"); b,c,sf,page = _launch_context(p,state)
-            _set_task(stage="test_opening_x"); page.goto(_HOME_URL,wait_until="domcontentloaded",timeout=20000)
-            mounted = _wait_for_app(page,started,15000); page.wait_for_timeout(500)
+            _set_task(stage="test_opening_x"); page.goto(_HOME_URL,wait_until="commit",timeout=12000)
+            mounted = _wait_for_app(page,started,10000); page.wait_for_timeout(500)
             lr=_login_state(page); ob=_onboarding_state(page)
             r={"success":not lr and mounted,"stage":"test_complete" if not lr and mounted else ("login_required" if lr else "x_dom_not_mounted"),"message":"Playwright launched and X mounted with the saved browser session." if not lr and mounted else "X did not finish mounting its web application in the browser.","login_redirect":lr,"onboarding":ob,"diagnostics":_diagnostics(page)}
             _set_task(stage=r["stage"],last_result=r); return r
@@ -293,7 +294,7 @@ def test_x_compose():
         with sync_playwright() as p:
             b,c,sf,page=_launch_context(p,state); _open_compose(page,started); lr=_login_state(page); ob=_onboarding_state(page)
             if lr or ob: return {"success":False,"stage":"login_required","message":"X did not open the compose page in the saved session.","login_redirect":lr,"onboarding":ob,"diagnostics":_diagnostics(page)}
-            _set_task(stage="compose_waiting_editor"); editor=_wait_for_editor(page,started,12000); ef=editor is not None
+            _set_task(stage="compose_waiting_editor"); editor=_wait_for_editor(page,started,10000); ef=editor is not None
             _set_task(stage="compose_checking_post_button"); button=_find_post_button(page) if ef else None
             r={"success":ef,"stage":"compose_ready" if ef else "editor_not_found","message":"X compose UI loaded and the tweet editor was found." if ef else "X opened, but the tweet editor was not rendered.","login_redirect":lr,"onboarding":ob,"editor_found":ef,"editor":None if not ef else {"data_testid":editor.get_attribute("data-testid"),"role":editor.get_attribute("role"),"contenteditable":editor.get_attribute("contenteditable")},"post_button_found":button is not None,"post_button":None if button is None else {"data_testid":button.get_attribute("data-testid"),"aria_label":button.get_attribute("aria-label"),"enabled":not button.is_disabled(timeout=800)},"diagnostics":_diagnostics(page)}
             _set_task(stage=r["stage"],last_result=r); return r
