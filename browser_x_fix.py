@@ -1,8 +1,4 @@
-"""X posting flow.
-
-Uses the proven local keyboard.type() flow, then re-locates the editor after
-React updates so verification does not rely on a stale DOM locator.
-"""
+"""X posting flow with bounded navigation and React-safe editor verification."""
 
 import base64
 import mimetypes
@@ -14,6 +10,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 POST_TIMEOUT = 45
+NAV_TIMEOUT_MS = 12000
 
 
 def _find_editor(page):
@@ -42,7 +39,6 @@ def _focus_editor(page, editor) -> bool:
 
 
 def _current_editor_text(page) -> tuple[Any, str]:
-    """Re-find the editor after typing because X/React may replace its DOM node."""
     current = _find_editor(page)
     if not current:
         return None, ""
@@ -56,14 +52,10 @@ def _type_into_editor(page, editor, text: str) -> bool:
         page.keyboard.press("Control+A")
         page.keyboard.press("Backspace")
         page.wait_for_timeout(500)
-        # Same real keyboard input mechanism as the proven local test.
         page.keyboard.type(text, delay=120)
         page.wait_for_timeout(1000)
     except Exception:
         return False
-
-    # IMPORTANT: re-locate after keyboard input. X can replace the React
-    # contenteditable during the input event, making the original locator stale.
     current, actual = _current_editor_text(page)
     return bool(current and text.strip() in actual)
 
@@ -84,7 +76,6 @@ def _button_state(button) -> dict[str, Any] | None:
 
 
 def _find_post_button_any_state(page):
-    """Find Post even when disabled, so diagnostics show the real state."""
     try:
         loc = page.locator('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]')
         for i in range(min(loc.count(), 10)):
@@ -106,6 +97,54 @@ def _find_post_button_any_state(page):
     except Exception:
         pass
     return None
+
+
+def _diagnostic_nav_error(page, exc: Exception, stage: str) -> dict[str, Any]:
+    return {
+        "success": False,
+        "stage": stage,
+        "message": f"X navigation failed: {type(exc).__name__}: {exc}",
+        "diagnostics": bx._diagnostics(page),
+    }
+
+
+def _open_compose_safe(page, started: float) -> dict[str, Any]:
+    """Open compose with a bounded navigation.
+
+    The previous implementation used wait_until=domcontentloaded on X. When
+    X's document/navigation stalled, the API could sit far beyond the 60s task
+    deadline. We now use commit + an explicit short DOM-mount wait and return a
+    structured result instead of blocking the whole request.
+    """
+    bx._set_task(stage="opening_compose_direct")
+    try:
+        bx._check_deadline(started)
+        page.goto(
+            bx.COMPOSE_URL,
+            wait_until="commit",
+            timeout=NAV_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError as exc:
+        return _diagnostic_nav_error(page, exc, "navigation_timeout")
+    except Exception as exc:
+        return _diagnostic_nav_error(page, exc, "navigation_exception")
+
+    bx._set_task(stage="waiting_x_dom")
+    deadline = min(time.time() + 12000 / 1000, started + bx.TASK_HARD_TIMEOUT - 1)
+    while time.time() < deadline:
+        try:
+            if page.evaluate("() => !!document.body && document.body.children.length > 0"):
+                return {"success": True, "stage": "compose_opened"}
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
+
+    return {
+        "success": False,
+        "stage": "x_dom_not_mounted",
+        "message": "X navigation committed, but the web application DOM did not mount before the task deadline.",
+        "diagnostics": bx._diagnostics(page),
+    }
 
 
 def _decode_image(image_base64: str, filename: str) -> tuple[bytes, str, str]:
@@ -149,7 +188,6 @@ def _upload_image(page, image_base64: str, filename: str) -> dict[str, Any]:
 
 
 def _post_verified(page, editor, text: str, started: float, upload: dict[str, Any] | None) -> dict[str, Any]:
-    # Re-find one final time immediately before validation/click.
     current_editor, before = _current_editor_text(page)
     if not current_editor or text.strip() not in before:
         return {"success": False, "stage": "final_text_verification_failed", "message": "Text is not present in the current X editor immediately before Post; nothing clicked.", "editor_text": before, "upload": upload, "diagnostics": bx._diagnostics(page)}
@@ -170,12 +208,10 @@ def _post_verified(page, editor, text: str, started: float, upload: dict[str, An
     if not button or not state or state.get("disabled") or state.get("aria_disabled") == "true":
         return {"success": False, "stage": "post_button_disabled", "message": "Post button was found but remained disabled; nothing clicked.", "post_button": state, "editor_text": _editor_text(editor), "upload": upload, "diagnostics": bx._diagnostics(page)}
 
-    # Re-find editor once more because waiting for React state may replace it.
     current_editor, final_text = _current_editor_text(page)
     if not current_editor or text.strip() not in final_text:
         return {"success": False, "stage": "final_text_verification_failed", "message": "Editor text changed before click; nothing clicked.", "editor_text": final_text, "post_button": state, "upload": upload, "diagnostics": bx._diagnostics(page)}
 
-    # Re-find Post too, so we click the currently rendered button.
     button = _find_post_button_any_state(page)
     state = _button_state(button)
     if not button or not state or state.get("disabled") or state.get("aria_disabled") == "true":
@@ -186,9 +222,8 @@ def _post_verified(page, editor, text: str, started: float, upload: dict[str, An
     button.click(timeout=5000)
     bx._set_task(stage="verifying_post")
 
-    deadline = time.time() + 10
+    deadline = min(time.time() + 10, started + bx.TASK_HARD_TIMEOUT - 1)
     while time.time() < deadline:
-        bx._check_deadline(started)
         _, last_text = _current_editor_text(page)
         if not last_text:
             return {"success": True, "stage": "post_complete", "message": "X Post click completed and composer was cleared.", "post_button": state, "upload": upload, "diagnostics": bx._diagnostics(page)}
@@ -210,7 +245,10 @@ def test_x_typing(text: str = "LOCAL_X_TYPING_TEST") -> dict[str, Any]:
     try:
         with sync_playwright() as p:
             browser, context, state_file, page = bx._launch_context(p, state)
-            bx._open_compose(page, started)
+            opened = _open_compose_safe(page, started)
+            if not opened.get("success"):
+                opened["text"] = text
+                return opened
             if bx._login_state(page):
                 return {"success": False, "stage": "login_required", "message": "X browser session has expired.", "diagnostics": bx._diagnostics(page)}
             editor = bx._wait_for_editor(page, started, 12000)
@@ -244,8 +282,12 @@ def post_x(text: str, image_base64: str | None = None, image_filename: str = "im
         with sync_playwright() as p:
             bx._set_task(stage="launching_browser")
             browser, context, state_file, page = bx._launch_context(p, state)
-            bx._set_task(stage="opening_compose")
-            bx._open_compose(page, started)
+
+            opened = _open_compose_safe(page, started)
+            if not opened.get("success"):
+                opened["text"] = text
+                return opened
+
             bx._check_deadline(started)
             if bx._login_state(page):
                 return {"success": False, "stage": "login_required", "message": "X browser session has expired.", "diagnostics": bx._diagnostics(page)}
