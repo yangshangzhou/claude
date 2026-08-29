@@ -76,13 +76,10 @@ def _keyboard_input(page,text):
 
 
 def _click_enabled_post(page, started, timeout_seconds=8):
-    print("[DEBUG] ENTER _click_enabled_post")
     deadline=min(time.time()+timeout_seconds, started+bx.TASK_HARD_TIMEOUT-2)
     checks=0; last=None
     while time.time()<deadline:
-        checks+=1
-        print(f"[DEBUG] POST CHECK #{checks}")
-        bx._check_deadline(started); last=_post_state(page)
+        bx._check_deadline(started); checks+=1; last=_post_state(page)
         if last.get('found') and last.get('disabled') is False:
             selector=f'[data-testid="{last.get("data_testid")}"]'
             button=page.locator(selector).first
