@@ -6,7 +6,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from browser_x import browser_status, test_x_browser, test_x_compose
-from browser_x_fix import post_x, test_x_typing
+from browser_x_post_v3 import post_x
+from browser_x_fix import test_x_typing
 from mcp_server import mcp, mcp_app
 
 logging.basicConfig(level=logging.INFO)
@@ -90,7 +91,7 @@ def create_post(post: Post):
         raise HTTPException(status_code=422, detail="X post is limited to 280 characters")
 
     try:
-        logger.info("Calling post_x")
+        logger.info("Calling post_x v3")
         result = post_x(text, image_base64=post.image_base64, image_filename=post.image_filename)
         logger.info("CREATE_POST finish success=%s stage=%s elapsed=%.2fs", result.get("success"), result.get("stage"), time.time()-start)
     except Exception:
