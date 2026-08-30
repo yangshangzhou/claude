@@ -41,6 +41,36 @@ def _post_state(page):
         return {"found":False,"error":f"{type(exc).__name__}: {exc}"}
 
 
+def _network_check(page):
+    """Check browser/network reachability without changing the compose state."""
+    try:
+        return page.evaluate("""
+        async () => {
+          const result = {
+            online: navigator.onLine,
+            url: location.href,
+            origin: location.origin,
+            fetch_ok: false,
+            fetch_status: null,
+            fetch_status_text: null,
+            fetch_error: null,
+            resource_count: performance.getEntriesByType('resource').length
+          };
+          try {
+            const r = await fetch('/compose/post', {method:'GET', cache:'no-store', credentials:'include'});
+            result.fetch_ok = r.ok;
+            result.fetch_status = r.status;
+            result.fetch_status_text = r.statusText;
+          } catch (e) {
+            result.fetch_error = `${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : e}`;
+          }
+          return result;
+        }
+        """) or {"error":"empty network check result"}
+    except Exception as exc:
+        return {"error":f"{type(exc).__name__}: {exc}"}
+
+
 def _wait_until_page_and_editor_ready(page, started, timeout_seconds=25):
     deadline=min(time.time()+timeout_seconds, started+bx.TASK_HARD_TIMEOUT-5)
     checks=0; last=None
@@ -119,7 +149,8 @@ def post_x(text: str, image_base64=None, image_filename="image.png") -> dict[str
             bx._set_task(stage='step3_post_clicking'); click_result=_click_enabled_post(page,started)
             final_post_state=_post_state(page)
             if not click_result.get('clicked'):
-                result={"success":False,"stage":"step3_post_not_clicked","message":"3、Editor 内容已验证，但 POST 在等待窗口内仍不可点击；未强制点击。","step1_editor":editor_before,"step1_post_button":post_before,"step2_keyboard_input":{"input_text":text,"operation":operation,"editor_after":editor_after,"text_verified":verified,"post_button_after":post_after},"step3_post_click":click_result,"diagnostics":bx._diagnostics(page)}
+                network=_network_check(page)
+                result={"success":False,"stage":"step3_post_not_clicked","message":"3、Editor 内容已验证，但 POST 在等待窗口内仍不可点击；已追加网络连通性检查，未强制点击。","step1_editor":editor_before,"step1_post_button":post_before,"step2_keyboard_input":{"input_text":text,"operation":operation,"editor_after":editor_after,"text_verified":verified,"post_button_after":post_after},"step3_post_click":click_result,"post_button_final":final_post_state,"network_check":network,"diagnostics":bx._diagnostics(page)}
                 bx._set_task(stage=result['stage'],last_result=result); return result
 
             page.wait_for_timeout(1200)
